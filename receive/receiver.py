@@ -89,7 +89,7 @@ class RecordLogger:
                         'ltp_block_size',
                         'ltp_segment_size',
                         'session_count',
-                        'delivery_time_s',
+                        'delivery_time_ms',
                         'throughput_mbps'
                     ])
                 print(f"[记录器] CSV文件已创建: {self.csv_file}")
@@ -119,11 +119,12 @@ class RecordLogger:
             timestamp = record.get("timestamp", time.time())
 
             data_size = input_data.get("data_size", 0)
-            delivery_time_s = performance_data.get("delivery_time_s", 0)
+            delivery_time_ms = performance_data.get("delivery_time_ms", 0)
 
             # 计算吞吐量（Mbps）
-            if delivery_time_s > 0:
-                throughput_mbps = (data_size * 8 / 1_000_000) / delivery_time_s
+            if delivery_time_ms > 0:
+                # delivery_time_ms是毫秒，需要转换为秒来计算吞吐量
+                throughput_mbps = (data_size * 8 / 1_000_000) / (delivery_time_ms / 1000)
             else:
                 throughput_mbps = 0.0
 
@@ -140,7 +141,7 @@ class RecordLogger:
                     output_data.get("ltp_block_size", 0),
                     output_data.get("ltp_segment_size", 0),
                     output_data.get("session_count", 0),
-                    round(delivery_time_s, 6),
+                    round(delivery_time_ms, 3),
                     throughput_mbps
                 ])
 
@@ -182,7 +183,7 @@ class RecordLogger:
                            ltp_block_size: int,
                            ltp_segment_size: int,
                            session_count: int,
-                           delivery_time_s: float):
+                           delivery_time_ms: float):
         """
         记录一次传输的完整信息
 
@@ -195,7 +196,7 @@ class RecordLogger:
             ltp_block_size: LTP Block大小
             ltp_segment_size: LTP Segment大小
             session_count: 会话数量
-            delivery_time_s: 业务交付时间（秒）
+            delivery_time_ms: 业务交付时间（毫秒）
         """
         record = {
             "input": {
@@ -211,7 +212,7 @@ class RecordLogger:
                 "session_count": session_count
             },
             "performance": {
-                "delivery_time_s": delivery_time_s
+                "delivery_time_ms": delivery_time_ms
             },
             "timestamp": time.time()
         }
@@ -423,6 +424,7 @@ class ReceiverNode:
             data_size = data.get("data_size", 0)
             bundle_size = data.get("bundle_size", 1000)
             dest_addr = data.get("dest_addr", "192.168.1.1")  # 发送节点的地址
+            sequence = data.get("sequence", 1)  # 获取sequence字段，用于EID配置
 
             # 清除start_timestamp接收事件，准备新的传输
             self.start_timestamp_received_event.clear()
@@ -441,6 +443,7 @@ class ReceiverNode:
             bandwidth_bps = int(transmission_rate_mbps * 1e6)
 
             print(f"\n[链路配置] 接收节点同步配置网络链路")
+            print(f"  - Sequence: {sequence} (将用作EID)")
             print(f"  - 目标地址: {dest_addr}")
             print(f"  - 误码率: {bit_error_rate}")
             print(f"  - 延时: {delay_ms}ms")
@@ -451,6 +454,9 @@ class ReceiverNode:
             # 调用configure_network配置网络
             if self.use_bp_ltp and self.bp_ltp_receiver:
                 try:
+                    # 根据sequence更新接收端的EID
+                    self.bp_ltp_receiver.update_eid(sequence)
+
                     # 调用BP/LTP接收器的configure_network方法
                     self.bp_ltp_receiver.configure_network(
                         dest_addr=dest_addr,
@@ -560,21 +566,21 @@ class ReceiverNode:
                 print(f"[接收模式] 使用模拟模式（TCP接收已完成）")
                 end_timestamp = time.time()
 
-            # 计算业务交付时间（秒）
+            # 计算业务交付时间（毫秒）
             start_timestamp = self.current_transmission.get("start_timestamp", 0.0)
 
             # 验证时间戳有效性
             if start_timestamp <= 0 or start_timestamp > end_timestamp:
                 print(f"[警告] 开始时间戳无效 (start={start_timestamp}, end={end_timestamp})")
-                delivery_time_s = 0.0
+                delivery_time_ms = 0.0
             else:
-                delivery_time_s = end_timestamp - start_timestamp
+                delivery_time_ms = (end_timestamp - start_timestamp) * 1000
 
             start_time_str = datetime.fromtimestamp(start_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f') if start_timestamp > 0 else 'N/A'
             end_time_str = datetime.fromtimestamp(end_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')
             print(f"[时间计算] 开始: {start_timestamp}")
             print(f"[时间计算] 结束: {end_timestamp}")
-            print(f"[传输指标] 业务交付时间: {delivery_time_s:.6f}s")
+            print(f"[传输指标] 业务交付时间: {delivery_time_ms:.3f}ms")
 
             # 生成训练记录
             self.logger.record_transmission(
@@ -586,7 +592,7 @@ class ReceiverNode:
                 ltp_block_size=protocol_params.get("ltp_block_size", 0),
                 ltp_segment_size=protocol_params.get("ltp_segment_size", 0),
                 session_count=protocol_params.get("session_count", 0),
-                delivery_time_s=delivery_time_s
+                delivery_time_ms=delivery_time_ms
             )
 
             return True

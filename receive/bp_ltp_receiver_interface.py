@@ -20,10 +20,19 @@ class BPLTPReceiverInterface:
             own_eid_number: 本节点EID数字（例如 2，对应 ipn:2.1）
         """
         self.own_eid_number = own_eid_number
-        self.own_eid = f"ipn:{own_eid_number}.2"
 
         print(f"[BP/LTP接收器] 初始化完成")
-        print(f"  本节点EID: {self.own_eid}")
+
+    def update_eid(self, sequence: int):
+        """
+        根据sequence更新本节点的EID
+
+        Args:
+            sequence: CSV配置中的sequence字段，用作EID号
+        """
+        self.own_eid = f"ipn:{self.own_eid_number}.{sequence}"
+        print(f"[BP/LTP接收器] EID已更新")
+        print(f"  新EID: {self.own_eid}")
 
     def configure_network(self, dest_addr: str, bandwidth: int, tx_delay: int, loss_rate: float):
         """

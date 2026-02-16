@@ -41,6 +41,7 @@ class BPLTPInterface:
         self.dest_addr = dest_addr
         self.dest_udp_addr = dest_udp_addr
         self.bp_ttl = bp_ttl
+        self.destination_sequence = 2  # 默认为2，即 ipn:X.2
 
         # 当前协议栈参数
         self.current_bundle_size = 1024
@@ -51,8 +52,19 @@ class BPLTPInterface:
 
         print(f"[BP/LTP接口] 初始化完成")
         print(f"  源节点: {self.source_eid}")
-        print(f"  目标节点: ipn:{self.destination_eid}.2")
+        print(f"  目标节点: ipn:{self.destination_eid}.{self.destination_sequence}")
         print(f"  目标地址: {self.dest_addr}")
+
+    def update_destination_sequence(self, sequence: int):
+        """
+        根据sequence更新目标节点的EID后缀
+
+        Args:
+            sequence: CSV配置中的sequence字段，用作目标EID后缀
+        """
+        self.destination_sequence = sequence
+        print(f"[BP/LTP接口] 目标EID后缀已更新")
+        print(f"  新目标节点: ipn:{self.destination_eid}.{self.destination_sequence}")
 
     def configure_link_parameters(self,
                                   bit_error_rate: float,
@@ -218,18 +230,21 @@ class BPLTPInterface:
             # 计算发送速率（Bytes/s）
             send_rate_B = int(transmission_rate_mbps * 1_000_000 / 8)
 
+            # 构造目标EID
+            destination_eid = f"ipn:{self.destination_eid}.{self.destination_sequence}"
+
             print(f"\n[BP/LTP传输]")
             print(f"  数据大小: {data_size} bytes")
             print(f"  Bundle数量: {nbr_of_cycles}")
             print(f"  发送速率: {send_rate_B} Bytes/s")
             print(f"  源: {self.source_eid}")
-            print(f"  目标: ipn:{self.destination_eid}.2")
+            print(f"  目标: {destination_eid}")
 
             # 发送数据
             send_time = send_bpdriver_command(
                 nbr_of_cycles=nbr_of_cycles,
                 source=self.source_eid,
-                destination=f"ipn:{self.destination_eid}.2",
+                destination=destination_eid,
                 packet_size=self.current_bundle_size,
                 BP_TTL=self.bp_ttl,
                 send_rate_B=send_rate_B

@@ -228,7 +228,7 @@ class SenderNode:
         如果配置文件存在，从CSV中读取；否则使用默认值
 
         Returns:
-            包含误码率、延时、传输速率的字典
+            包含误码率、延时、传输速率和sequence的字典
         """
         if self.config_data and len(self.config_data) > 0:
             # 从CSV配置中循环读取
@@ -237,7 +237,8 @@ class SenderNode:
             link_state = {
                 "bit_error_rate": current_config["bit_error_rate"],
                 "delay_ms": current_config["delay_ms"],
-                "transmission_rate_mbps": current_config["transmission_rate_mbps"]
+                "transmission_rate_mbps": current_config["transmission_rate_mbps"],
+                "sequence": (current_config["sequence"] % 27) + 2  # 添加sequence字段，用于接收端EID配置
             }
 
             print(f"[CSV配置 {current_config['sequence']}] {current_config.get('description', '')}")
@@ -248,7 +249,8 @@ class SenderNode:
             link_state = {
                 "bit_error_rate": 1e-5,      # 误码率
                 "delay_ms": 100.0,            # 延时 (毫秒)
-                "transmission_rate_mbps": 10.0  # 传输速率 (Mbps)
+                "transmission_rate_mbps": 10.0,  # 传输速率 (Mbps)
+                "sequence": 2  # 默认sequence为1
             }
             return link_state
 
@@ -393,6 +395,9 @@ class SenderNode:
             发送是否成功
         """
         try:
+            # 从link_state中提取sequence字段（用于接收端EID配置）
+            sequence = link_state.get("sequence", 1)
+            # sequence = (sequence % 10) + 2
             # 构造链路配置信息
             link_config = {
                 "type": "link_config",
@@ -400,6 +405,7 @@ class SenderNode:
                 "bundle_size": self.protocol_params['bundle_size'],
                 "link_state": link_state,
                 "dest_addr": self.own_host,  # 发送节点的IP地址
+                "sequence": sequence,  # 添加sequence字段，用于接收端EID配置
                 "timestamp": time.time()
             }
 
@@ -417,7 +423,7 @@ class SenderNode:
             ack = sock.recv(1024)
             sock.close()
 
-            print(f"[链路配置] 已发送链路配置到节点B，接收节点确认: {ack.decode('utf-8')}")
+            print(f"[链路配置] 已发送链路配置到节点B (sequence={sequence})，接收节点确认: {ack.decode('utf-8')}")
             return True
 
         except Exception as e:
@@ -451,16 +457,20 @@ class SenderNode:
             if self.use_bp_ltp and self.bp_ltp_interface:
                 try:
                     transmission_rate = link_state.get("transmission_rate_mbps", 10.0) if link_state else 10.0
+                    sequence = link_state.get("sequence", 1) if link_state else 1
 
                     print(f"[传输参数] Bundle大小: {self.protocol_params['bundle_size']}, "
                         f"LTP Block大小: {self.protocol_params['ltp_block_size']}, "
                         f"LTP Segment大小: {self.protocol_params['ltp_segment_size']}, "
                         f"会话数: {self.protocol_params['session_count']}")
 
-                    # 步骤1：设置transmission contact
+                    # 步骤1：根据sequence更新目标EID
+                    self.bp_ltp_interface.update_destination_sequence(sequence)
+
+                    # 步骤2：设置transmission contact
                     self.bp_ltp_interface.setup_transmission_contact(transmission_rate)
 
-                    # 步骤2：通过BP/LTP发送数据，获取真正的发送时间戳
+                    # 步骤3：通过BP/LTP发送数据，获取真正的发送时间戳
                     bp_send_time = self.bp_ltp_interface.transmit_data_via_bp_ltp(
                         data_size=data_size,
                         transmission_rate_mbps=transmission_rate
@@ -473,14 +483,14 @@ class SenderNode:
                         # 使用BP/LTP的实际发送时间戳
                         start_timestamp = bp_send_time
 
-                        # 步骤3：等待接收端的完成通知
+                        # 步骤4：等待接收端的完成通知
                         print(f"[等待接收] 等待接收端BP/LTP接收完成通知...")
                         completion_received = self.wait_for_reception_completion(timeout=3000)
 
                         if completion_received:
                             print(f"[接收完成] 收到接收端完成通知")
 
-                            # 步骤4：接收完成后，发送真正的bp_send_time给接收端
+                            # 步骤5：接收完成后，发送真正的bp_send_time给接收端
                             print(f"[时间同步] 发送BP/LTP开始时间戳到接收端...")
                             try:
                                 notify_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
