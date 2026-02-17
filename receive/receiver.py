@@ -246,9 +246,17 @@ class ReceiverNode:
         self.own_eid_number = own_eid_number
         self.sender_host = sender_host
         self.sender_notification_port = sender_notification_port
-        
+
         self.logger = RecordLogger(csv_file=csv_file)
         self.running = True
+
+        # 链路配置锁 - 防止并发处理多个链路配置请求
+        self.link_config_lock = threading.Lock()
+        self.link_config_processing = False
+
+        # 消息去重：记录已处理的transmission_id（保留最近100个）
+        self.processed_transmissions = set()
+        self.max_processed_history = 100
 
         # 用于存储当前传输的元数据
         self.current_transmission = {
@@ -299,7 +307,7 @@ class ReceiverNode:
 
         attempt = 0
         backoff = 1.0
-        max_backoff = 60.0
+        max_backoff = 30.0
 
         while True:
             attempt += 1
@@ -412,6 +420,7 @@ class ReceiverNode:
     def handle_link_config(self, data: Dict[str, Any]) -> bool:
         """
         处理链路配置请求 - 接收来自发送节点A的链路状态，并同步配置网络
+        使用锁机制防止并发处理多个链路配置请求
 
         Args:
             data: 包含链路状态、数据大小和bundle大小的配置
@@ -419,7 +428,15 @@ class ReceiverNode:
         Returns:
             处理是否成功
         """
+        # 尝试获取锁，如果已经在处理中，则直接返回成功（避免重复处理）
+        if not self.link_config_lock.acquire(blocking=False):
+            print(f"[链路配置] 已有链路配置正在处理中，忽略此次重复请求")
+            return True
+
         try:
+            self.link_config_processing = True
+            print(f"[链路配置] 开始处理链路配置请求")
+
             link_state = data.get("link_state", {})
             data_size = data.get("data_size", 0)
             bundle_size = data.get("bundle_size", 1000)
@@ -428,6 +445,23 @@ class ReceiverNode:
 
             # 清除start_timestamp接收事件，准备新的传输
             self.start_timestamp_received_event.clear()
+            self.reception_event.clear()
+
+            # 重置reception_result
+            self.reception_result = {
+                "stop_time": 0.0,
+                "report": "",
+                "success": False
+            }
+
+            # 重置current_transmission
+            self.current_transmission = {
+                "data_size": 0,
+                "start_timestamp": 0.0,
+                "link_state": {},
+                "protocol_params": {},
+                "bundle_size": 1000
+            }
 
             # 提取链路参数
             bit_error_rate = link_state.get("bit_error_rate", 1e-5)
@@ -435,9 +469,9 @@ class ReceiverNode:
             transmission_rate_mbps = link_state.get("transmission_rate_mbps", 10.0)
 
             # 计算丢包率（用于tc命令）
-            from dtn_ion import calculate_packet_loss
-            loss_rate = calculate_packet_loss(bit_error_rate, bundle_size)
-            loss_rate_percent = loss_rate * 100
+            # from dtn_ion import calculate_packet_loss
+            # loss_rate = calculate_packet_loss(bit_error_rate, bundle_size)
+            loss_rate_percent = 0
 
             # 转换带宽为bit/s
             bandwidth_bps = int(transmission_rate_mbps * 1e6)
@@ -482,11 +516,20 @@ class ReceiverNode:
             self.current_transmission["link_state"] = link_state
             self.current_transmission["bundle_size"] = bundle_size
 
+            print(f"[链路配置] 链路配置处理完成")
             return True
 
         except Exception as e:
             print(f"[错误] 处理链路配置失败: {e}")
+            import traceback
+            traceback.print_exc()
             return False
+
+        finally:
+            # 释放锁
+            self.link_config_processing = False
+            self.link_config_lock.release()
+            print(f"[链路配置] 链路配置锁已释放")
 
     def handle_data_transmission(self, data: Dict[str, Any]) -> bool:
         """
@@ -544,7 +587,7 @@ class ReceiverNode:
             if self.use_bp_ltp and self.bp_ltp_receiver:
                 # 步骤1：等待BP/LTP接收完成（最多等待3000秒）
                 print(f"[等待接收] 等待BP/LTP接收完成...")
-                if self.reception_event.wait(timeout=3000):
+                if self.reception_event.wait(timeout=6000):
                     if self.reception_result.get("success"):
                         end_timestamp = self.reception_result.get("stop_time", time.time())
                         print(f"[接收完成] BP/LTP接收已完成，结束时间: {datetime.fromtimestamp(end_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')}")
@@ -679,28 +722,69 @@ class ReceiverNode:
             # 解析消息
             message = json.loads(message_data.decode('utf-8'))
             message_type = message.get("type")
+            transmission_id = message.get("transmission_id")
 
-            print(f"[消息类型] {message_type}")
+            print(f"[消息类型] {message_type}, transmission_id={transmission_id}")
+
+            # 消息去重：使用(transmission_id, message_type)组合作为唯一键
+            # 同一轮传输的不同消息类型应该分别处理
+            dedup_key = f"{transmission_id}:{message_type}" if transmission_id else None
+
+            if dedup_key and dedup_key in self.processed_transmissions:
+                print(f"[去重] 消息已处理过 (key={dedup_key})，直接返回ACK")
+                client_socket.sendall(b"OK_ALREADY_PROCESSED")
+                return
 
             if message_type == "link_config":
-                # 处理链路配置请求
+                # 链路配置请求：先快速发送ACK，避免发送端超时
+                # 然后同步处理（单线程模式，确保顺序执行）
+                print(f"[链路配置] 接收到链路配置请求，快速发送ACK...")
+                client_socket.sendall(b"OK")
+                print(f"[链路配置] ACK已发送，开始同步处理配置...")
+
+                # 同步处理链路配置（不使用线程，确保单线程顺序执行）
                 success = self.handle_link_config(message)
+
+                if success:
+                    print(f"[链路配置] 链路配置处理完成，等待数据传输")
+
+                    # 记录已处理的消息（使用dedup_key）
+                    if dedup_key:
+                        self.processed_transmissions.add(dedup_key)
+                        # 限制集合大小
+                        if len(self.processed_transmissions) > self.max_processed_history:
+                            oldest = list(self.processed_transmissions)[:len(self.processed_transmissions)//2]
+                            for old_id in oldest:
+                                self.processed_transmissions.discard(old_id)
+                        print(f"[去重] 已记录key={dedup_key}（当前记录数: {len(self.processed_transmissions)}）")
+                else:
+                    print(f"[错误] 链路配置处理失败")
+
+                # 处理完成，socket已经发送了ACK，直接返回
+                return
+
+            elif message_type == "start_timestamp":
+                # BP/LTP模式：只接收时间戳，不接收数据负载
+                success = self.handle_data_transmission(message)
 
             elif message_type == "data_transmission":
                 success = self.handle_data_transmission(message)
 
-            elif message_type == "metadata":
-                success = self.handle_metadata(message)
-
-                # 接收数据部分（如果有）
+                # 对于data_transmission，接收实际的数据负载（如果有）
                 if "data_size" in message:
                     data_size = message["data_size"]
+                    print(f"[数据接收] 准备接收 {data_size} 字节的数据负载...")
                     remaining_data = b''
                     while len(remaining_data) < data_size:
                         chunk = client_socket.recv(min(4096, data_size - len(remaining_data)))
                         if not chunk:
                             break
                         remaining_data += chunk
+                    print(f"[数据接收] 已接收 {len(remaining_data)} 字节")
+
+            elif message_type == "metadata":
+                # metadata消息不包含额外的数据负载，只是元数据JSON
+                success = self.handle_metadata(message)
 
             else:
                 print(f"[警告] 未知的消息类型: {message_type}")
@@ -708,6 +792,17 @@ class ReceiverNode:
 
             # 发送确认
             if success:
+                # 记录已处理的消息（使用dedup_key）
+                if dedup_key:
+                    self.processed_transmissions.add(dedup_key)
+                    # 限制集合大小，保留最近的N个
+                    if len(self.processed_transmissions) > self.max_processed_history:
+                        # 移除最早的（简单处理：清空一半）
+                        oldest = list(self.processed_transmissions)[:len(self.processed_transmissions)//2]
+                        for old_id in oldest:
+                            self.processed_transmissions.discard(old_id)
+                    print(f"[去重] 已记录key={dedup_key}（当前记录数: {len(self.processed_transmissions)}）")
+
                 ack_message = "OK"
             else:
                 ack_message = "FAILED"
@@ -767,13 +862,11 @@ class ReceiverNode:
                 try:
                     client_socket, client_address = server_socket.accept()
 
-                    # 为每个客户端创建一个新线程
-                    client_thread = threading.Thread(
-                        target=self.handle_client,
-                        args=(client_socket, client_address),
-                        daemon=True
-                    )
-                    client_thread.start()
+                    # 单线程模式：在主线程中直接处理，确保顺序执行
+                    # 不创建新线程，处理完一个连接再accept下一个
+                    print(f"[单线程] 在主线程中处理连接...")
+                    self.handle_client(client_socket, client_address)
+                    print(f"[单线程] 连接处理完成，继续监听下一个连接")
 
                 except KeyboardInterrupt:
                     break
@@ -789,48 +882,25 @@ class ReceiverNode:
 
 def main():
     """主函数"""
-    import argparse
-
-    parser = argparse.ArgumentParser(description='BP/LTP接收节点B')
-    parser.add_argument('--listen-port', type=int, default=5001,
-                        help='监听端口')
-    parser.add_argument('--optimizer-host', default='192.168.137.1',
-                        help='优化器(电脑C)的IP地址')
-    parser.add_argument('--optimizer-port', type=int, default=5003,
-                        help='优化器的数据接收端口')
-
-    # BP/LTP相关参数
-    parser.add_argument('--own-eid-number', type=int, default=8,
-                        help='本节点EID数字（例如 2，对应 ipn:2.1）')
-    parser.add_argument('--use-bp-ltp', action='store_true', default=False,
-                        help='启用BP/LTP协议栈接收（默认使用模拟模式）')
-    parser.add_argument('--simulate', action='store_true', default=False,
-                        help='强制使用模拟模式（不使用BP/LTP）')
-    # 记录器相关参数
-    parser.add_argument('--csv-file', type=str, default="records_1.csv",
-                        help='CSV文件路径，用于保存训练记录（例如：training_records.csv）')
-    # 发送端通知相关参数
-    parser.add_argument('--sender-host', default='192.168.137.194',
-                        help='发送节点A的IP地址（用于发送完成通知）')
-    parser.add_argument('--sender-notification-port', type=int, default=5009,
-                        help='发送节点A的通知监听端口')
- 
-    
-    
-    args = parser.parse_args()
-
-    # 如果指定了--simulate，则禁用BP/LTP
-    use_bp_ltp = args.use_bp_ltp and not args.simulate
+    # 直接在代码中设置参数
+    listen_port = 5001
+    optimizer_host = '192.168.137.1'
+    optimizer_port = 5003
+    own_eid_number = 8
+    use_bp_ltp = True  # 启用BP/LTP模式
+    csv_file = "records_1.csv"
+    sender_host = '192.168.137.194'  # 发送节点A的IP地址
+    sender_notification_port = 5009  # 发送节点A的通知监听端口
 
     receiver = ReceiverNode(
-        listen_port=args.listen_port,
-        optimizer_host=args.optimizer_host,
-        optimizer_port=args.optimizer_port,
-        own_eid_number=args.own_eid_number,
-        # use_bp_ltp=use_bp_ltp
-        csv_file=args.csv_file,
-        sender_host=args.sender_host,
-        sender_notification_port=args.sender_notification_port
+        listen_port=listen_port,
+        optimizer_host=optimizer_host,
+        optimizer_port=optimizer_port,
+        own_eid_number=own_eid_number,
+        use_bp_ltp=use_bp_ltp,
+        csv_file=csv_file,
+        sender_host=sender_host,
+        sender_notification_port=sender_notification_port
     )
 
     receiver.run()

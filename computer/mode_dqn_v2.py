@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-优化器/算力电脑C (Optimizer Computer C) - DQN v2.2
+优化器/算力电脑C (Optimizer Computer C) - DQN v2.3
 功能：
 1. 接收节点A的优化请求
-2. 基于DQN强化学习模型生成优化参数（Bundle、Block、Segment）
-3. 自动计算LTP会话数量（不是训练得出）
-4. 将优化参数发送给节点A
-5. 接收节点B的训练记录
-6. 使用训练记录进行DQN模型的训练和更新
+2. 基于DQN强化学习模型生成优化参数（Bundle、Block）
+3. 自适应选择Segment大小（基于网络状态）
+4. 自动计算LTP会话数量（不是训练得出）
+5. 将优化参数发送给节点A
+6. 接收节点B的训练记录
+7. 使用训练记录进行DQN模型的训练和更新
 
-关键改进（v2.2）：
-- 动作空间包含(bundle, block, segment)三元组
+关键改进（v2.3）：
+- 动作空间：32个采样的(bundle, block)组合
 - bundle_size支持15种选项：1k-100k
 - block_size支持20种选项：20k-1000k
-- segment_size作为第四个独立维度：7种选项（200-1400）
-- 约束保证：block >= bundle AND block % bundle == 0 AND segment <= block*50%
+- segment_size：自适应选择（基于延时、误码率）：7种选项（200-1400）
+- 约束保证：block >= bundle AND block % bundle == 0
 - session_count通过calculate_ltp_sessions()计算，不参与训练
 """
 
@@ -98,13 +99,13 @@ class ExperienceReplay:
 class DQNNetwork:
     """DQN神经网络 - 使用简化的全连接网络"""
 
-    def __init__(self, state_dim: int = 4, action_dim: int = 9, hidden_dim: int = 128):
+    def __init__(self, state_dim: int = 4, action_dim: int = 32, hidden_dim: int = 128):
         """
         初始化DQN网络
 
         Args:
             state_dim: 状态维度
-            action_dim: 动作维度（从16改为9：3×3）
+            action_dim: 动作维度（v2.3: 32个采样动作）
             hidden_dim: 隐层维度
         """
         self.state_dim = state_dim
@@ -330,18 +331,21 @@ class RewardCalculator:
 
 
 class DQNOptimizer:
-    """DQN优化器 - 基于深度Q网络的协议参数优化（v2：session_count通过公式计算）"""
+    """DQN优化器 - 基于深度Q网络的协议参数优化（v2.3：segment自适应）"""
 
     def __init__(self):
-        """初始化DQN优化器（v2.2：segment作为第四个独立维度）"""
+        """初始化DQN优化器（v2.3：segment自适应，32个采样动作）"""
         self.state_dim = 4  # data_size, BER, delay, rate
 
-        # v2.2改进：生成包含segment的三元组动作空间
-        all_valid_tuples = self._generate_all_valid_3tuples()
-        self.valid_action_tuples = all_valid_tuples  # 直接使用所有有效组合
-        self.action_dim = len(self.valid_action_tuples)
+        # v2.3改进：生成所有有效组合，然后采样32个
+        all_valid_combinations = self._generate_all_valid_combinations()
+        self.valid_action_pairs = self._sample_32_combinations(all_valid_combinations)
+        self.action_dim = len(self.valid_action_pairs)  # 32个动作
 
-        # 初始化网络（action_dim现在是动态的）
+        # segment选项（自适应选择）
+        self.segment_options = [200, 400, 600, 800, 1000, 1200, 1400]
+
+        # 初始化网络（action_dim现在是32）
         self.network = DQNNetwork(self.state_dim, self.action_dim)
 
         # 经验回放
@@ -363,32 +367,29 @@ class DQNOptimizer:
         self.training_steps = 0
         self.episode_rewards = deque(maxlen=100)
 
-        print("[DQN优化器v2.2] 初始化完成（segment作为第四维度）")
+        print("[DQN优化器v2.3] 初始化完成（segment自适应）")
         print(f"  状态维度: {self.state_dim}")
-        print(f"  动作维度: {self.action_dim} (所有满足约束的三元组)")
+        print(f"  动作维度: {self.action_dim} (采样得32个有效组合)")
         print(f"  网络隐层维度: 128")
+        print(f"  segment_size: 基于网络状态自适应选择")
         print(f"  session_count: 通过calculate_ltp_sessions()计算")
 
         # 打印动作空间覆盖统计
         bundle_values = set()
         block_values = set()
-        segment_values = set()
-        for bundle, block, segment in self.valid_action_tuples:
+        for bundle, block in self.valid_action_pairs:
             bundle_values.add(bundle)
             block_values.add(block)
-            segment_values.add(segment)
 
         print(f"  Bundle大小覆盖: {len(bundle_values)}种（{sorted(bundle_values)[:3]}...）")
         print(f"  Block大小覆盖: {len(block_values)}种（{sorted(block_values)[:3]}...）")
-        print(f"  Segment大小覆盖: {len(segment_values)}种（{sorted(segment_values)}）")
 
-    def _generate_all_valid_3tuples(self) -> List[Tuple[int, int, int]]:
+    def _generate_all_valid_combinations(self) -> List[Tuple[int, int]]:
         """
-        生成所有满足约束的(bundle_size, block_size, segment_size)三元组
+        生成所有满足约束的(bundle_size, block_size)组合
         约束:
         1. block_size >= bundle_size
         2. block_size % bundle_size == 0
-        3. segment_size <= block_size * 50%
         """
         bundle_sizes = [
             1000, 2000, 4000, 6000, 8000, 10000, 12000, 16000,
@@ -399,17 +400,119 @@ class DQNOptimizer:
             160000, 180000, 200000, 220000, 240000, 260000, 280000,
             300000, 350000, 400000, 450000, 500000, 1000000
         ]
-        segment_sizes = [200, 400, 600, 800, 1000, 1200, 1400]
 
-        valid_tuples = []
+        valid_combinations = []
         for bundle in bundle_sizes:
             for block in block_sizes:
-                # 约束1和2：block >= bundle AND block % bundle == 0
+                # 约束：block >= bundle AND block % bundle == 0
                 if block >= bundle and block % bundle == 0:
-                    for segment in segment_sizes:
-                        valid_tuples.append((bundle, block, segment))
+                    valid_combinations.append((bundle, block))
 
-        return valid_tuples
+        return valid_combinations
+
+    def _sample_32_combinations(self, all_combinations: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        """
+        从所有有效组合中采样32个代表性组合
+        策略：对每个bundle_size，选择2-3个代表性的block_size
+
+        Args:
+            all_combinations: 所有有效的(bundle, block)组合
+
+        Returns:
+            采样得到的32个组合
+        """
+        from collections import defaultdict
+
+        # 按bundle_size分组
+        by_bundle = defaultdict(list)
+        for bundle, block in all_combinations:
+            by_bundle[bundle].append(block)
+
+        sampled = []
+        for bundle in sorted(by_bundle.keys()):
+            blocks = sorted(by_bundle[bundle])
+
+            # 采样策略：选择最小、中等、最大的block（最多3个）
+            if len(blocks) == 1:
+                sampled.append((bundle, blocks[0]))
+            elif len(blocks) == 2:
+                sampled.extend([(bundle, b) for b in blocks])
+            else:
+                # 选择最小、中间、最大
+                sampled.append((bundle, blocks[0]))
+                sampled.append((bundle, blocks[len(blocks)//2]))
+                sampled.append((bundle, blocks[-1]))
+
+        # 最多返回32个
+        return sampled[:32]
+
+    def _adaptive_segment_size(self, delay_ms: float, bit_error_rate: float, block_size: int) -> int:
+        """
+        根据网络状态自适应选择segment_size
+
+        分析逻辑：
+        - 高延时/高误码率 → 选择较大segment（减少协议开销）
+        - 低延时/低误码率 → 选择较小segment（更细粒度控制）
+
+        Args:
+            delay_ms: 延时（毫秒）
+            bit_error_rate: 误码率
+            block_size: Block大小（用于约束检查）
+
+        Returns:
+            选择的segment大小
+        """
+        # 归一化网络状态
+        # 延时因子：0-1，0表示最好，1表示最差（1000ms）
+        delay_factor = min(delay_ms / 1000.0, 1.0)
+
+        # 误码率因子：0-1，0表示无错误，1表示很高（0.01）
+        ber_factor = min(bit_error_rate / 0.01, 1.0)
+
+        # 综合因子（权重：延时0.6，误码率0.4）
+        adversity = 0.6 * delay_factor + 0.4 * ber_factor
+
+        # 根据恶劣程度选择segment
+        if adversity > 0.7:
+            # 恶劣条件：选择最大的segment来减少开销
+            segment_size = 1400
+        elif adversity > 0.5:
+            # 较差条件
+            segment_size = 1000
+        elif adversity > 0.3:
+            # 中等条件
+            segment_size = 600
+        else:
+            # 良好条件：选择较小segment以获得最细粒度控制
+            segment_size = 200
+
+        return segment_size
+
+    def _validate_segment_size(self, segment_size: int, block_size: int) -> int:
+        """
+        验证segment_size是否合理
+        约束：segment_size不应过大（相对于block_size）
+
+        Args:
+            segment_size: 候选segment大小
+            block_size: Block大小
+
+        Returns:
+            验证后的segment大小
+        """
+        # 规则：segment不应超过block的50%
+        max_segment = int(block_size * 0.5)
+
+        if segment_size > max_segment:
+            # 降低到合理范围
+            valid_segments = [s for s in self.segment_options if s <= max_segment]
+            if valid_segments:
+                return max(valid_segments)
+            else:
+                # 降级到最小值
+                return 200
+
+        return segment_size
 
     def discretize_state(self, state: Dict[str, float]) -> np.ndarray:
         """
@@ -459,19 +562,22 @@ class DQNOptimizer:
     def action_to_params(self, action: int,
                         data_size: int,
                         delay_ms: float,
-                        transmission_rate_mbps: float) -> Dict[str, int]:
+                        transmission_rate_mbps: float,
+                        bit_error_rate: float = 1e-5) -> Dict[str, int]:
         """
-        将动作索引转换为协议参数（v2.2：segment作为独立维度）
+        将动作索引转换为协议参数（v2.3：segment自适应选择）
 
         关键改进：
-        1. 从三元组中直接获取bundle、block、segment
-        2. session_count通过calculate_ltp_sessions()计算
+        1. 从采样的有效组合中获取bundle、block
+        2. segment_size根据网络状态自适应选择
+        3. session_count通过calculate_ltp_sessions()计算
 
         Args:
-            action: 动作索引 (0 to action_dim-1)
+            action: 动作索引 (0 to 31)
             data_size: 数据大小（用于计算session）
-            delay_ms: 延时（用于计算session）
+            delay_ms: 延时（用于计算session和segment选择）
             transmission_rate_mbps: 传输速率（用于计算session）
+            bit_error_rate: 误码率（用于segment选择）
 
         Returns:
             协议参数字典
@@ -480,8 +586,18 @@ class DQNOptimizer:
         if action >= self.action_dim:
             raise ValueError(f"动作{action}超出范围[0, {self.action_dim-1}]")
 
-        # 从三元组中直接查表获取参数
-        bundle_size, ltp_block_size, ltp_segment_size = self.valid_action_tuples[action]
+        # 从采样的有效组合中获取参数
+        bundle_size, ltp_block_size = self.valid_action_pairs[action]
+
+        # 自适应选择segment_size
+        ltp_segment_size = self._adaptive_segment_size(
+            delay_ms=delay_ms,
+            bit_error_rate=bit_error_rate,
+            block_size=ltp_block_size
+        )
+
+        # 约束检查和验证
+        ltp_segment_size = self._validate_segment_size(ltp_segment_size, ltp_block_size)
 
         # 计算LTP会话数量（不是训练得出！）
         trans_rate_bytes = transmission_rate_mbps * 1_000_000 / 8  # 转换为bytes/s
@@ -496,7 +612,7 @@ class DQNOptimizer:
         params = {
             "bundle_size": bundle_size,
             "ltp_block_size": ltp_block_size,
-            "ltp_segment_size": ltp_segment_size,
+            "ltp_segment_size": ltp_segment_size,  # 自适应选择
             "session_count": ltp_sessions  # 通过公式计算
         }
 
@@ -530,17 +646,18 @@ class DQNOptimizer:
         # 选择动作
         action = self.select_action(state_vector, training=True)
 
-        # 转换为参数（segment已包含在三元组中）
+        # 转换为参数（segment自适应选择）
         params = self.action_to_params(
             action=action,
             data_size=data_size,
             delay_ms=state["delay_ms"],
-            transmission_rate_mbps=state["transmission_rate_mbps"]
+            transmission_rate_mbps=state["transmission_rate_mbps"],
+            bit_error_rate=state["bit_error_rate"]
         )
 
         # 日志输出
         print(f"[DQN优化] 动作={action}/{self.action_dim}, Bundle={params['bundle_size']}, "
-              f"Block={params['ltp_block_size']}, Segment={params['ltp_segment_size']}, "
+              f"Block={params['ltp_block_size']}, Segment={params['ltp_segment_size']}(自适应), "
               f"Session={params['session_count']}(计算)")
 
         return params
@@ -674,7 +791,7 @@ class DQNOptimizer:
     def _find_action_from_params(self, params: Dict[str, int]) -> int:
         """
         从参数字典反向查找动作索引
-        v2.2改进：支持三元组匹配
+        v2.3改进：匹配(bundle, block)对
 
         Args:
             params: 协议参数字典
@@ -684,20 +801,20 @@ class DQNOptimizer:
         """
         bundle = params.get("bundle_size", 1024)
         block = params.get("ltp_block_size", 512)
-        segment = params.get("ltp_segment_size", 200)
 
         try:
-            # 第一优先级：完全匹配 (bundle, block, segment)
-            for idx, (b, bl, s) in enumerate(self.valid_action_tuples):
-                if b == bundle and bl == block and s == segment:
-                    return idx
-
-            # 第二优先级：匹配bundle和block（segment可能不同）
-            for idx, (b, bl, s) in enumerate(self.valid_action_tuples):
+            # 查找匹配的(bundle, block)对
+            for idx, (b, bl) in enumerate(self.valid_action_pairs):
                 if b == bundle and bl == block:
                     return idx
 
-            # 第三优先级：随机选择一个有效动作
+            # 如果没有完全匹配，找最接近的
+            # 优先匹配bundle，其次匹配block
+            for idx, (b, bl) in enumerate(self.valid_action_pairs):
+                if b == bundle:
+                    return idx
+
+            # 仍然没有匹配，随机选择一个有效动作
             return np.random.randint(0, self.action_dim)
 
         except Exception as e:
@@ -881,10 +998,13 @@ class OptimizerServer:
     def run(self):
         """运行优化器服务器"""
         print("="*60)
-        print("DQN优化器服务器v2启动")
+        print("DQN优化器服务器v2.3启动")
         print(f"参数请求服务器: 端口 {self.param_request_port}")
         print(f"记录接收服务器: 端口 {self.record_receive_port}")
-        print("关键改进: session_count通过calculate_ltp_sessions()计算")
+        print("关键改进: ")
+        print("  - 32个采样动作空间(bundle, block)")
+        print("  - segment_size自适应选择（基于网络状态）")
+        print("  - session_count通过calculate_ltp_sessions()计算")
         print("="*60)
 
         # 启动两个服务器线程

@@ -14,7 +14,6 @@ import json
 import time
 import struct
 import csv
-import threading
 import os
 from datetime import datetime
 from typing import Dict, Any, List, Optional
@@ -72,12 +71,11 @@ class SenderNode:
             "session_count": 10          # 会话数量
         }
 
-        # BP/LTP接收完成通知机制
-        self.reception_completion_event = threading.Event()
+        # BP/LTP接收完成通知机制（单线程模式）
         self.notification_listener_port = 5009  # 用于接收接收端的完成通知
-        self.notification_listener_thread = None
-        self.notification_listener_running = False
 
+        # 消息去重：为每轮传输生成唯一ID
+        self.current_transmission_id = None
 
         # 从CSV加载配置
         self.config_data = self.load_config_from_csv()
@@ -100,77 +98,9 @@ class SenderNode:
                 print(f"[警告] 初始化BP/LTP接口失败: {e}")
                 self.use_bp_ltp = False
 
-    def start_notification_listener(self):
-        """
-        启动通知监听线程，用于接收接收端的完成通知
-        """
-        if self.notification_listener_running:
-            return
-
-        self.notification_listener_running = True
-        self.notification_listener_thread = threading.Thread(
-            target=self._notification_listener_worker,
-            daemon=True
-        )
-        self.notification_listener_thread.start()
-        print(f"[通知监听] 监听线程已启动，端口: {self.notification_listener_port}")
-
-    def _notification_listener_worker(self):
-        """
-        通知监听线程工作函数
-        """
-        try:
-            server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_sock.bind(('0.0.0.0', self.notification_listener_port))
-            server_sock.listen(5)
-            server_sock.settimeout(1.0)  # 设置超时以便可以检查running标志
-
-            print(f"[通知监听] 开始监听端口 {self.notification_listener_port}")
-
-            while self.notification_listener_running:
-                try:
-                    client_sock, client_addr = server_sock.accept()
-                    print(f"[通知监听] 收到来自 {client_addr} 的连接")
-
-                    # 接收消息
-                    length_data = client_sock.recv(4)
-                    if length_data:
-                        message_length = struct.unpack('!I', length_data)[0]
-                        message_data = b''
-                        while len(message_data) < message_length:
-                            chunk = client_sock.recv(min(4096, message_length - len(message_data)))
-                            if not chunk:
-                                break
-                            message_data += chunk
-
-                        message = json.loads(message_data.decode('utf-8'))
-                        msg_type = message.get("type")
-
-                        if msg_type == "reception_complete":
-                            print(f"[通知监听] 接收到接收完成通知")
-                            self.reception_completion_event.set()
-
-                        # 发送确认
-                        client_sock.sendall(b"ACK")
-
-                    client_sock.close()
-
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    if self.notification_listener_running:
-                        print(f"[通知监听] 处理连接时出错: {e}")
-
-            server_sock.close()
-            print(f"[通知监听] 监听线程已停止")
-
-        except Exception as e:
-            print(f"[错误] 通知监听线程异常: {e}")
-
     def wait_for_reception_completion(self, timeout: float = 300) -> bool:
         """
-        等待接收端的完成通知
+        等待接收端的完成通知（单线程模式，主线程直接阻塞监听）
 
         Args:
             timeout: 超时时间（秒）
@@ -178,9 +108,170 @@ class SenderNode:
         Returns:
             是否收到完成通知
         """
-        self.reception_completion_event.clear()
-        return self.reception_completion_event.wait(timeout=timeout)
-    
+        print(f"[等待接收] 主线程开始监听端口 {self.notification_listener_port}（超时{timeout}秒）")
+
+        try:
+            # 创建监听socket
+            server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server_sock.bind(('0.0.0.0', self.notification_listener_port))
+            server_sock.listen(1)
+            server_sock.settimeout(timeout)  # 设置超时
+
+            print(f"[等待接收] 正在等待接收端的完成通知...")
+
+            try:
+                # 阻塞等待接收端连接
+                client_sock, client_addr = server_sock.accept()
+                print(f"[等待接收] 收到来自 {client_addr} 的连接")
+
+                client_sock.settimeout(30.0)  # 客户端socket超时
+
+                try:
+                    # 接收消息长度
+                    length_data = client_sock.recv(4)
+                    if not length_data:
+                        print(f"[警告] 未接收到消息长度")
+                        client_sock.close()
+                        server_sock.close()
+                        return False
+
+                    message_length = struct.unpack('!I', length_data)[0]
+                    print(f"[等待接收] 消息长度: {message_length} 字节")
+
+                    # 接收完整消息
+                    message_data = b''
+                    while len(message_data) < message_length:
+                        chunk = client_sock.recv(min(4096, message_length - len(message_data)))
+                        if not chunk:
+                            print(f"[警告] 接收消息数据时连接断开")
+                            break
+                        message_data += chunk
+
+                    if len(message_data) < message_length:
+                        print(f"[警告] 消息接收不完整: {len(message_data)}/{message_length}")
+                        client_sock.close()
+                        server_sock.close()
+                        return False
+
+                    # 解析消息
+                    message = json.loads(message_data.decode('utf-8'))
+                    msg_type = message.get("type")
+                    print(f"[等待接收] 消息类型: {msg_type}")
+
+                    if msg_type == "reception_complete":
+                        print(f"[等待接收] ✅ 接收到接收完成通知")
+
+                        # 发送确认（接收端会阻塞等待这个确认）
+                        client_sock.sendall(b"ACK")
+                        print(f"[等待接收] ACK已发送给接收端")
+
+                        client_sock.close()
+                        server_sock.close()
+                        return True
+                    else:
+                        print(f"[等待接收] ⚠️  未知消息类型: {msg_type}")
+                        client_sock.close()
+                        server_sock.close()
+                        return False
+
+                except Exception as inner_e:
+                    print(f"[错误] 处理消息时出错: {inner_e}")
+                    import traceback
+                    traceback.print_exc()
+                    client_sock.close()
+                    server_sock.close()
+                    return False
+
+            except socket.timeout:
+                print(f"[超时] 等待接收完成通知超时（{timeout}秒）")
+                server_sock.close()
+                return False
+
+        except Exception as e:
+            print(f"[错误] 监听端口异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def send_start_timestamp_to_receiver(self, start_timestamp: float, data_size: int, max_attempts: int = 30) -> bool:
+        """
+        发送开始时间戳到接收端（使用重试+指数退避，最多尝试max_attempts次）
+
+        Args:
+            start_timestamp: BP/LTP传输开始时间戳
+            data_size: 数据大小
+            max_attempts: 最大重试次数（默认30次，约30分钟）
+
+        Returns:
+            是否发送成功
+        """
+        import random
+
+        attempt = 0
+        backoff = 1.0  # 初始退避时间（秒）
+        max_backoff = 60.0  # 最大退避时间（秒）
+
+        print(f"[时间同步] 开始发送BP/LTP开始时间戳到接收端（最多尝试{max_attempts}次）...")
+
+        while attempt < max_attempts:
+            attempt += 1
+
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(30.0)
+                sock.connect((self.receiver_host, self.receiver_port))
+
+                # 准备消息（BP/LTP模式下只传递时间戳，不发送数据负载）
+                header = {
+                    "type": "start_timestamp",  # 使用独立的消息类型，避免与data_transmission混淆
+                    "transmission_id": self.current_transmission_id,  # 消息去重ID
+                    "start_timestamp": start_timestamp,
+                    "data_size": data_size
+                }
+                header_json = json.dumps(header).encode('utf-8')
+                message_len = struct.pack('!I', len(header_json))
+
+                # 发送消息
+                sock.sendall(message_len)
+                sock.sendall(header_json)
+
+                # 等待确认
+                ack = sock.recv(1024)
+                sock.close()
+
+                if ack:
+                    ack_text = ack.decode('utf-8', errors='ignore')
+                    if "ALREADY_PROCESSED" in ack_text:
+                        print(f"[时间同步] 接收端已处理过此消息 (transmission_id={self.current_transmission_id})，无需重复发送")
+                        return True
+                    else:
+                        print(f"[时间同步] 成功发送开始时间戳到接收端（第{attempt}次尝试），确认: {ack_text}")
+                        return True
+
+            except Exception as e:
+                print(f"[警告] 第{attempt}次发送开始时间戳失败: {e}")
+
+                # 如果已达最大尝试次数，返回失败
+                if attempt >= max_attempts:
+                    print(f"[错误] 已达最大重试次数{max_attempts}，放弃发送开始时间戳")
+                    return False
+
+                # 计算下次重试的等待时间（指数退避 + 随机抖动）
+                sleep_time = backoff + random.uniform(0, 0.5)
+                print(f"[重试] 在 {sleep_time:.1f}s 后进行第{attempt + 1}次尝试")
+                time.sleep(sleep_time)
+
+                # 更新退避时间（指数增长，但不超过最大值）
+                backoff = min(max_backoff, backoff * 2)
+
+                # 关闭socket
+                try:
+                    sock.close()
+                except:
+                    pass
+
+        return False
 
     def load_config_from_csv(self) -> list:
         """
@@ -383,52 +474,93 @@ class SenderNode:
             # 模拟模式（原有的TODO注释）
             print(f"[模拟模式] 在实际部署时，这里会调用BP/LTP协议栈的配置接口")
 
-    def send_link_config_to_receiver(self, data_size: int, link_state: Dict[str, float]) -> bool:
+    def send_link_config_to_receiver(self, data_size: int, link_state: Dict[str, float], max_attempts: int = 10) -> bool:
         """
         在传输数据之前，向接收节点B发送链路配置信息，让接收节点同步配置网络
+        使用重试机制确保接收端一定能收到
 
         Args:
             data_size: 待发送数据量大小
             link_state: 链路状态
+            max_attempts: 最大重试次数（默认10次）
 
         Returns:
             发送是否成功
         """
-        try:
-            # 从link_state中提取sequence字段（用于接收端EID配置）
-            sequence = link_state.get("sequence", 1)
-            # sequence = (sequence % 10) + 2
-            # 构造链路配置信息
-            link_config = {
-                "type": "link_config",
-                "data_size": data_size,
-                "bundle_size": self.protocol_params['bundle_size'],
-                "link_state": link_state,
-                "dest_addr": self.own_host,  # 发送节点的IP地址
-                "sequence": sequence,  # 添加sequence字段，用于接收端EID配置
-                "timestamp": time.time()
-            }
+        import random
 
-            # 连接到接收节点
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(10.0)
-            sock.connect((self.receiver_host, self.receiver_port))
+        # 从link_state中提取sequence字段（用于接收端EID配置）
+        sequence = link_state.get("sequence", 1)
 
-            # 发送链路配置
-            config_json = json.dumps(link_config).encode('utf-8')
-            sock.sendall(struct.pack('!I', len(config_json)))
-            sock.sendall(config_json)
+        # 构造链路配置信息
+        link_config = {
+            "type": "link_config",
+            "transmission_id": self.current_transmission_id,  # 消息去重ID
+            "data_size": data_size,
+            "bundle_size": self.protocol_params['bundle_size'],
+            "link_state": link_state,
+            "dest_addr": self.own_host,  # 发送节点的IP地址
+            "sequence": sequence,  # 添加sequence字段，用于接收端EID配置
+            "timestamp": time.time()
+        }
 
-            # 等待接收节点确认
-            ack = sock.recv(1024)
-            sock.close()
+        config_json = json.dumps(link_config).encode('utf-8')
+        message_len = struct.pack('!I', len(config_json))
 
-            print(f"[链路配置] 已发送链路配置到节点B (sequence={sequence})，接收节点确认: {ack.decode('utf-8')}")
-            return True
+        attempt = 0
+        backoff = 1.0
+        max_backoff = 10.0
 
-        except Exception as e:
-            print(f"[错误] 发送链路配置失败: {e}")
-            return False
+        print(f"[链路配置] 准备发送链路配置到节点B (sequence={sequence}, 最多尝试{max_attempts}次)...")
+
+        while attempt < max_attempts:
+            attempt += 1
+
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(10.0)
+                sock.connect((self.receiver_host, self.receiver_port))
+
+                # 发送链路配置
+                sock.sendall(message_len)
+                sock.sendall(config_json)
+
+                # 等待接收节点确认
+                ack = sock.recv(1024)
+                sock.close()
+
+                if ack:
+                    ack_text = ack.decode('utf-8', errors='ignore')
+                    if "ALREADY_PROCESSED" in ack_text:
+                        print(f"[链路配置] 接收端已处理过此消息 (transmission_id={self.current_transmission_id})，无需重复发送")
+                        return True
+                    else:
+                        print(f"[链路配置] 已发送链路配置到节点B (第{attempt}次尝试)，接收节点确认: {ack_text}")
+                        return True
+
+            except Exception as e:
+                print(f"[警告] 第{attempt}次发送链路配置失败: {e}")
+
+                # 如果已达最大尝试次数，返回失败
+                if attempt >= max_attempts:
+                    print(f"[错误] 已达最大重试次数{max_attempts}，链路配置发送失败")
+                    return False
+
+                # 计算下次重试的等待时间（指数退避 + 随机抖动）
+                sleep_time = backoff + random.uniform(0, 0.3)
+                print(f"[重试] 在 {sleep_time:.1f}s 后进行第{attempt + 1}次尝试")
+                time.sleep(sleep_time)
+
+                # 更新退避时间
+                backoff = min(max_backoff, backoff * 2)
+
+                # 关闭socket
+                try:
+                    sock.close()
+                except:
+                    pass
+
+        return False
 
     def transmit_data(self, data_size: int, link_state: Dict[str, float] = None) -> tuple:
         """
@@ -442,7 +574,7 @@ class SenderNode:
             (start_timestamp, success)
         """
         try:
-            # 步骤4：在传输数据之前，发送链路配置信息到接收节点
+            # 步骤1：在传输数据之前，发送链路配置信息到接收节点
             if link_state:
                 config_sent = self.send_link_config_to_receiver(data_size, link_state)
                 if not config_sent:
@@ -469,7 +601,7 @@ class SenderNode:
 
                     # 步骤2：设置transmission contact
                     self.bp_ltp_interface.setup_transmission_contact(transmission_rate)
-
+                    time.sleep(3)
                     # 步骤3：通过BP/LTP发送数据，获取真正的发送时间戳
                     bp_send_time = self.bp_ltp_interface.transmit_data_via_bp_ltp(
                         data_size=data_size,
@@ -483,39 +615,28 @@ class SenderNode:
                         # 使用BP/LTP的实际发送时间戳
                         start_timestamp = bp_send_time
 
-                        # 步骤4：等待接收端的完成通知
+                        # 步骤4：等待接收端的完成通知（主线程阻塞）
                         print(f"[等待接收] 等待接收端BP/LTP接收完成通知...")
                         completion_received = self.wait_for_reception_completion(timeout=3000)
 
                         if completion_received:
                             print(f"[接收完成] 收到接收端完成通知")
 
-                            # 步骤5：接收完成后，发送真正的bp_send_time给接收端
-                            print(f"[时间同步] 发送BP/LTP开始时间戳到接收端...")
-                            try:
-                                notify_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                                notify_sock.settimeout(10.0)
-                                notify_sock.connect((self.receiver_host, self.receiver_port))
+                            # 步骤5：接收完成后，发送真正的bp_send_time给接收端（确保发送成功）
+                            success = self.send_start_timestamp_to_receiver(
+                                start_timestamp=start_timestamp,
+                                data_size=data_size,
+                                max_attempts=60  # 最多尝试60次
+                            )
 
-                                header = {
-                                    "start_timestamp": start_timestamp,
-                                    "data_size": data_size,
-                                    "type": "data_transmission"
-                                }
-                                header_json = json.dumps(header).encode('utf-8')
-                                notify_sock.sendall(struct.pack('!I', len(header_json)))
-                                notify_sock.sendall(header_json)
-
-                                ack = notify_sock.recv(1024)
-                                notify_sock.close()
-                                print(f"[时间同步] BP/LTP开始时间已发送，接收端确认: {ack.decode('utf-8')}")
-                            except Exception as notify_err:
-                                print(f"[警告] 发送开始时间戳失败: {notify_err}")
+                            if success:
+                                print(f"[传输流程] BP/LTP传输流程完整结束")
+                                return start_timestamp, True
+                            else:
+                                print(f"[错误] 发送开始时间戳失败，BP/LTP传输流程不完整")
                                 return start_timestamp, False
-
-                            return start_timestamp, True
                         else:
-                            print(f"[警告] 等待接收完成超时")
+                            print(f"[错误] 等待接收完成超时，BP/LTP传输流程不完整")
                             return start_timestamp, False
                     else:
                         print(f"[警告] BP/LTP传输失败，回退到模拟模式")
@@ -557,40 +678,88 @@ class SenderNode:
             print(f"[错误] 数据传输失败: {e}")
             return start_timestamp, False
 
-    def send_metadata(self, data_size: int, link_state: Dict[str, float]):
+    def send_metadata(self, data_size: int, link_state: Dict[str, float], max_attempts: int = 10) -> bool:
         """
         传输结束后，向接收节点B发送传输元数据
+        使用重试机制确保元数据一定能发送成功
 
         Args:
             data_size: 数据量大小
             link_state: 链路状态
+            max_attempts: 最大重试次数（默认10次）
+
+        Returns:
+            发送是否成功
         """
-        try:
-            # 构造元数据
-            metadata = {
-                "type": "metadata",
-                "data_size": data_size,
-                "link_state": link_state,
-                "protocol_params": self.protocol_params,
-                "timestamp": time.time()
-            }
+        import random
 
-            # 连接到接收节点
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(10.0)
-            sock.connect((self.receiver_host, self.receiver_port))
+        # 构造元数据
+        metadata = {
+            "type": "metadata",
+            "transmission_id": self.current_transmission_id,  # 消息去重ID
+            "data_size": data_size,
+            "link_state": link_state,
+            "protocol_params": self.protocol_params,
+            "timestamp": time.time()
+        }
 
-            # 发送元数据
-            metadata_json = json.dumps(metadata).encode('utf-8')
-            sock.sendall(struct.pack('!I', len(metadata_json)))
-            sock.sendall(metadata_json)
+        metadata_json = json.dumps(metadata).encode('utf-8')
+        message_len = struct.pack('!I', len(metadata_json))
 
-            sock.close()
+        attempt = 0
+        backoff = 1.0
+        max_backoff = 10.0
 
-            print(f"[元数据发送] 已发送传输元数据到节点B")
+        print(f"[元数据发送] 准备发送传输元数据（最多尝试{max_attempts}次）...")
 
-        except Exception as e:
-            print(f"[错误] 发送元数据失败: {e}")
+        while attempt < max_attempts:
+            attempt += 1
+
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(10.0)
+                sock.connect((self.receiver_host, self.receiver_port))
+
+                # 发送元数据
+                sock.sendall(message_len)
+                sock.sendall(metadata_json)
+
+                # 等待接收节点确认
+                ack = sock.recv(1024)
+                sock.close()
+
+                if ack:
+                    ack_text = ack.decode('utf-8', errors='ignore')
+                    if "ALREADY_PROCESSED" in ack_text:
+                        print(f"[元数据发送] 接收端已处理过此消息 (transmission_id={self.current_transmission_id})，无需重复发送")
+                        return True
+                    else:
+                        print(f"[元数据发送] 已发送传输元数据到节点B（第{attempt}次尝试），确认: {ack_text}")
+                        return True
+
+            except Exception as e:
+                print(f"[警告] 第{attempt}次发送元数据失败: {e}")
+
+                # 如果已达最大尝试次数，返回失败
+                if attempt >= max_attempts:
+                    print(f"[错误] 已达最大重试次数{max_attempts}，元数据发送失败")
+                    return False
+
+                # 计算下次重试的等待时间
+                sleep_time = backoff + random.uniform(0, 0.3)
+                print(f"[重试] 在 {sleep_time:.1f}s 后进行第{attempt + 1}次尝试")
+                time.sleep(sleep_time)
+
+                # 更新退避时间
+                backoff = min(max_backoff, backoff * 2)
+
+                # 关闭socket
+                try:
+                    sock.close()
+                except:
+                    pass
+
+        return False
 
     def run_transmission_cycle(self):
         """
@@ -600,51 +769,64 @@ class SenderNode:
         print(f"开始新的传输周期 (配置索引: {self.config_index})")
         print("="*60)
 
-        # 1. 产生业务请求
-        data_size = self.generate_business_request()
+        try:
+            # 0. 生成本轮传输的唯一ID（用于消息去重）
+            self.current_transmission_id = f"{int(time.time() * 1000)}_{self.config_index}"
+            print(f"[传输ID] {self.current_transmission_id}")
 
-        # 2. 获取链路状态
-        link_state = self.get_link_state()
-        print(f"[链路状态] 误码率: {link_state['bit_error_rate']}, "
-              f"延时: {link_state['delay_ms']}ms, "
-              f"速率: {link_state['transmission_rate_mbps']}Mbps")
+            # 1. 产生业务请求
+            data_size = self.generate_business_request()
 
-        # 3. 请求优化参数
-        optimized_params = self.request_optimized_params(data_size, link_state)
+            # 2. 获取链路状态
+            link_state = self.get_link_state()
+            print(f"[链路状态] 误码率: {link_state['bit_error_rate']}, "
+                  f"延时: {link_state['delay_ms']}ms, "
+                  f"速率: {link_state['transmission_rate_mbps']}Mbps")
 
-        # 4. 应用优化参数（传递链路状态和数据大小）
-        self.apply_protocol_params(optimized_params, link_state=link_state, data_size=data_size)
+            # 3. 请求优化参数
+            optimized_params = self.request_optimized_params(data_size, link_state)
 
-        # 5. 传输数据（传递链路状态）
-        start_timestamp, success = self.transmit_data(data_size, link_state=link_state)
+            # 4. 应用优化参数（传递链路状态和数据大小）
+            self.apply_protocol_params(optimized_params, link_state=link_state, data_size=data_size)
 
-        if success:
-            # 6. 发送元数据
-            self.send_metadata(data_size, link_state)
-            print("\n[周期完成] 传输周期成功完成\n")
-        else:
-            print("\n[周期失败] 传输周期失败\n")
+            # 5. 传输数据（传递链路状态）
+            start_timestamp, success = self.transmit_data(data_size, link_state=link_state)
 
-        # 更新配置索引（循环使用）
-        if self.config_data:
-            self.config_index = (self.config_index + 1) % len(self.config_data)
+            if success:
+                # 6. 发送元数据（确保发送成功）
+                metadata_sent = self.send_metadata(data_size, link_state, max_attempts=10)
+
+                if metadata_sent:
+                    print("\n[周期完成] 传输周期成功完成\n")
+                else:
+                    print("\n[周期失败] 元数据发送失败，传输周期不完整\n")
+            else:
+                print("\n[周期失败] 数据传输失败\n")
+
+        except Exception as e:
+            print(f"\n[周期异常] 传输周期发生异常: {e}\n")
+            import traceback
+            traceback.print_exc()
+
+        finally:
+            # 更新配置索引（循环使用）
+            if self.config_data:
+                self.config_index = (self.config_index + 1) % len(self.config_data)
+
+            print(f"[周期结束] 本轮传输流程完全结束，准备下一轮\n")
 
     def run(self, interval: int = 60):
         """
-        持续运行发送节点
+        持续运行发送节点（单线程模式）
 
         Args:
             interval: 传输周期间隔（秒）
         """
         print("="*60)
-        print("发送节点A启动")
+        print("发送节点A启动（单线程模式）")
         print(f"接收节点B: {self.receiver_host}:{self.receiver_port}")
         print(f"优化器C: {self.optimizer_host}:{self.optimizer_port}")
         print("="*60)
-
-        # 启动通知监听线程
-        if self.use_bp_ltp:
-            self.start_notification_listener()
 
         try:
             while True:
@@ -658,63 +840,35 @@ class SenderNode:
 
 def main():
     """主函数"""
-    import argparse
-
-    parser = argparse.ArgumentParser(description='BP/LTP发送节点A')
-    parser.add_argument('--receiver-host', default='192.168.137.164',
-                        help='接收节点B的IP地址')
-    parser.add_argument('--receiver-port', type=int, default=5001,
-                        help='接收节点B的端口')
-    
-    parser.add_argument('--optimizer-host', default='192.168.137.1',
-                        help='优化器(电脑C)的IP地址')
-    parser.add_argument('--optimizer-port', type=int, default=5002,
-                        help='优化器的端口')
-    
-    parser.add_argument('--own-host', default='192.168.137.194',
-                        help='本节点（发送节点A）的IP地址')
-    
-    parser.add_argument('--config-file', default='agent_sender/network_config.csv',
-                        help='网络配置CSV文件路径')
-    parser.add_argument('--interval', type=int, default=60,
-                        help='传输周期间隔（秒）')
+    # 直接在代码中设置参数
+    receiver_host = '192.168.137.164'  # 接收节点B的IP地址
+    receiver_port = 5001
+    optimizer_host = '192.168.137.1'  # 优化器(电脑C)的IP地址
+    optimizer_port = 5002
+    own_host = '192.168.137.194'  # 本节点（发送节点A）的IP地址
+    config_file = 'agent_sender/network_config.csv'
+    interval = 20  # 传输周期间隔（秒）
 
     # BP/LTP相关参数
-    parser.add_argument('--source-eid', default='ipn:9.2',
-                        help='源节点EID（例如 ipn:1.1）')
-    parser.add_argument('--destination-eid', default= 8,
-                        help='目标节点EID数字（例如 2）')
-    parser.add_argument('--dest-udp-addr', default='192.168.137.164:1113',
-                        help='目标UDP地址（例如 192.168.137.1:1113）')
-    parser.add_argument('--use-bp-ltp', action='store_true', default=False,
-                        help='启用BP/LTP协议栈（默认使用模拟模式）')
-    parser.add_argument('--simulate', action='store_true', default=False,
-                        help='强制使用模拟模式（不使用BP/LTP）')
-
-    args = parser.parse_args()
-
-    # 如果指定了--simulate，则禁用BP/LTP
-    use_bp_ltp = args.use_bp_ltp and not args.simulate
+    source_eid = 'ipn:9.2'
+    destination_eid = 8
+    dest_udp_addr = '192.168.137.164:1113'
+    use_bp_ltp = True  # 启用BP/LTP协议栈
 
     sender = SenderNode(
-        receiver_host=args.receiver_host,
-        receiver_port=args.receiver_port,
-
-        optimizer_host=args.optimizer_host,
-        optimizer_port=args.optimizer_port,
-
-        config_file=args.config_file,
-        own_host=args.own_host,
-
-        source_eid=args.source_eid,
-
-        destination_eid=args.destination_eid,
-        dest_udp_addr=args.dest_udp_addr,
-
-        # use_bp_ltp=use_bp_ltp
+        receiver_host=receiver_host,
+        receiver_port=receiver_port,
+        optimizer_host=optimizer_host,
+        optimizer_port=optimizer_port,
+        config_file=config_file,
+        own_host=own_host,
+        source_eid=source_eid,
+        destination_eid=destination_eid,
+        dest_udp_addr=dest_udp_addr,
+        use_bp_ltp=use_bp_ltp
     )
 
-    sender.run(interval=args.interval)
+    sender.run(interval=interval)
 
 
 if __name__ == "__main__":
