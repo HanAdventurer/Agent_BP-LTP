@@ -167,8 +167,13 @@ class RewardCalculator:
 class DQNOptimizerGPU:
     """DQN优化器 - GPU加速 + 快照机制"""
 
-    def __init__(self, device=None):
-        """初始化DQN优化器（GPU版本）"""
+    def __init__(self, device=None, pretrained_model: str = None):
+        """初始化DQN优化器（GPU版本）
+
+        Args:
+            device: 训练设备（cuda或cpu）
+            pretrained_model: 预训练模型路径（可选）
+        """
         self.state_dim = 4
         self.device = device if device else DEVICE
 
@@ -211,7 +216,6 @@ class DQNOptimizerGPU:
         # 快照机制锁
         self.snapshot_lock = threading.Lock()
         self.inference_net = None  # 用于推理的快照网络
-        self._create_inference_snapshot()
 
         print(f"[DQN优化器v2.3-GPU] 初始化完成")
         print(f"  设备: {self.device}")
@@ -220,6 +224,17 @@ class DQNOptimizerGPU:
         print(f"  GPU内存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB" if self.device.type == 'cuda' else "")
         print(f"  Bundle大小覆盖: {len(set([b for b, _ in self.valid_action_pairs]))}种")
         print(f"  Block大小覆盖: {len(set([bl for _, bl in self.valid_action_pairs]))}种")
+
+        # 加载预训练模型（如果提供）
+        if pretrained_model:
+            import os
+            if os.path.exists(pretrained_model):
+                self.load_pretrained_model(pretrained_model)
+            else:
+                print(f"[警告] 预训练模型文件不存在: {pretrained_model}")
+
+        # 创建推理快照（在加载预训练模型之后，或使用随机初始化）
+        self._create_inference_snapshot()
 
     def _create_inference_snapshot(self):
         """创建推理网络快照（CPU上）"""
@@ -232,6 +247,47 @@ class DQNOptimizerGPU:
             self.inference_net.eval()
 
             print(f"[快照] 已创建推理网络快照（版本{self.model_version}）")
+
+    def load_pretrained_model(self, model_path: str):
+        """加载预训练模型
+
+        Args:
+            model_path: 模型文件路径
+        """
+        try:
+            print(f"[预训练] 正在加载模型: {model_path}")
+
+            # 加载checkpoint
+            checkpoint = torch.load(model_path, map_location=self.device)
+
+            # 加载网络权重
+            self.policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
+            self.target_net.load_state_dict(checkpoint['target_net_state_dict'])
+            self.target_net.eval()
+
+            # 加载优化器状态
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+            # 加载训练状态
+            self.model_version = checkpoint.get('model_version', 0)
+            self.training_steps = checkpoint.get('training_steps', 0)
+            self.epsilon = checkpoint.get('epsilon', 0.1)
+
+            # 加载历史奖励（如果有）
+            if 'episode_rewards' in checkpoint:
+                self.episode_rewards = deque(checkpoint['episode_rewards'], maxlen=100)
+
+            print(f"[预训练] ✅ 已加载预训练模型: {model_path}")
+            print(f"  • 模型版本: {self.model_version}")
+            print(f"  • 训练步数: {self.training_steps}")
+            print(f"  • 探索率: {self.epsilon:.4f}")
+            print(f"  • 历史奖励数: {len(self.episode_rewards)}")
+            print(f"  → 推理快照将在初始化完成后创建")
+
+        except Exception as e:
+            print(f"[警告] 加载预训练模型失败: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _generate_all_valid_combinations(self) -> List[Tuple[int, int]]:
         """生成所有满足约束的(bundle_size, block_size)组合"""
@@ -543,14 +599,21 @@ class DQNOptimizerGPU:
 class OptimizerServer:
     """优化器服务器 - GPU版本"""
 
-    def __init__(self, param_request_port: int = 5002, record_receive_port: int = 5003):
+    def __init__(self, param_request_port: int = 5002, record_receive_port: int = 5003, pretrained_model: str = None):
+        """初始化优化器服务器
+
+        Args:
+            param_request_port: 参数请求端口
+            record_receive_port: 记录接收端口
+            pretrained_model: 预训练模型路径（可选）
+        """
         self.param_request_port = param_request_port
         self.record_receive_port = record_receive_port
 
         if not TORCH_AVAILABLE:
             raise RuntimeError("PyTorch未安装，无法启动GPU优化器")
 
-        self.dqn_optimizer = DQNOptimizerGPU()
+        self.dqn_optimizer = DQNOptimizerGPU(pretrained_model=pretrained_model)
         self.running = True
 
     def handle_param_request(self, request_data: Dict[str, Any]) -> Dict[str, int]:
@@ -716,19 +779,28 @@ class OptimizerServer:
 
 def main():
     """主函数"""
-    import argparse
+    # ==================== 配置参数（在此修改） ====================
+    param_request_port = 5002          # 参数请求端口
+    record_receive_port = 5003         # 训练记录端口
+    pretrained_model = None            # 预训练模型路径（None表示不使用）
 
-    parser = argparse.ArgumentParser(description='BP/LTP DQN优化器v2.3-GPU')
-    parser.add_argument('--param-port', type=int, default=5002,
-                        help='接收参数请求的端口')
-    parser.add_argument('--record-port', type=int, default=5003,
-                        help='接收训练记录的端口')
+    # 如果要使用预训练模型，取消下面一行的注释并修改路径：
+    # pretrained_model = '/root/agent/computer/dqn_model_pretrained.pth'
+    # ============================================================
 
-    args = parser.parse_args()
+    print("="*60)
+    print("BP/LTP DQN优化器v2.3-GPU")
+    print("="*60)
+    print(f"参数请求端口: {param_request_port}")
+    print(f"训练记录端口: {record_receive_port}")
+    print(f"预训练模型: {pretrained_model if pretrained_model else '不使用（随机初始化）'}")
+    print("="*60)
+    print()
 
     optimizer = OptimizerServer(
-        param_request_port=args.param_port,
-        record_receive_port=args.record_port
+        param_request_port=param_request_port,
+        record_receive_port=record_receive_port,
+        pretrained_model=pretrained_model
     )
 
     optimizer.run()
