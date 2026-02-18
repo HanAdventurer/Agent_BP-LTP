@@ -44,10 +44,10 @@ class BPLTPInterface:
         self.destination_sequence = 2  # 默认为2，即 ipn:X.2
 
         # 当前协议栈参数
-        self.current_bundle_size = 1024
-        self.current_ltp_block = 512
-        self.current_ltp_segment = 256
-        self.current_ltp_sessions = 1
+        self.current_bundle_size = 1000
+        self.current_ltp_block = 160000
+        self.current_ltp_segment = 1400
+        self.current_ltp_sessions = 5
         self.ltp_aggregation_time = 5
 
         print(f"[BP/LTP接口] 初始化完成")
@@ -159,6 +159,11 @@ class BPLTPInterface:
         print(f"  LTP Segment大小: {ltp_segment_size} bytes")
         print(f"  LTP会话数: {ltp_sessions}")
 
+        # 计算aggregation_time：每100k对应1秒，最小1秒，最大15秒
+        # 公式: (ltp_block_size + 50000) // 100000 实现四舍五入的效果
+        # 例如: 20k→1秒, 150k→2秒, 250k→3秒, 1000k→10秒, 1500k→15秒
+        self.ltp_aggregation_time = min(20, max(1, (ltp_block_size + 50000) // 100000))
+
         # 配置LTP span
         try:
             setup_ltp_span(
@@ -226,7 +231,8 @@ class BPLTPInterface:
         try:
             # 计算传输周期数（基于bundle大小）
             nbr_of_cycles = math.ceil(data_size / self.current_bundle_size)
-
+            if nbr_of_cycles > 500:
+                self.bp_ttl = self.bp_ttl + 3000
             # 计算发送速率（Bytes/s）
             send_rate_B = int(transmission_rate_mbps * 1_000_000 / 8)
 

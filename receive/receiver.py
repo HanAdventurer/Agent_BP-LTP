@@ -260,6 +260,7 @@ class ReceiverNode:
 
         # 用于存储当前传输的元数据
         self.current_transmission = {
+            "transmission_id": None,  # 新增：保存当前传输的ID
             "data_size": 0,
             "start_timestamp": 0.0,
             "link_state": {},
@@ -270,7 +271,6 @@ class ReceiverNode:
         # 接收状态追踪
         self.reception_thread = None
         self.reception_event = threading.Event()
-        self.start_timestamp_received_event = threading.Event()  # 用于等待start_timestamp
         self.reception_result = {
             "stop_time": 0.0,
             "report": "",
@@ -295,25 +295,34 @@ class ReceiverNode:
         """
         通知发送端接收已完成
 
+        注意：通知消息中包含 transmission_id，用于发送端验证，防止消息串扰
+
         Returns:
             通知是否成功
         """
+        # 获取当前传输的 transmission_id
+        transmission_id = self.current_transmission.get("transmission_id")
+
         notification = {
             "type": "reception_complete",
+            "transmission_id": transmission_id,  # 新增：包含传输ID
             "timestamp": time.time()
         }
+
+        print(f"[通知] 准备通知发送端接收完成 (transmission_id={transmission_id})")
         notification_json = json.dumps(notification).encode('utf-8')
         message_len = struct.pack('!I', len(notification_json))
 
         attempt = 0
         backoff = 1.0
         max_backoff = 30.0
+        max_attempts = 5  # ✅ 最大重试5次（因为网络可能有高延迟）
 
-        while True:
+        while attempt < max_attempts:  # ✅ 改为有限循环
             attempt += 1
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(10.0)
+                sock.settimeout(25.0)  # ✅ 增加timeout到15秒（适应高延迟网络）
                 sock.connect((self.sender_host, self.sender_notification_port))
 
                 sock.sendall(message_len)
@@ -324,7 +333,7 @@ class ReceiverNode:
 
                 if not ack:
                     print(f"[警告] 第{attempt}次发送未收到确认，准备重试")
-                    raise RuntimeError("empty ack")
+                    continue  # ✅ 继续重试，不抛异常
 
                 try:
                     ack_text = ack.decode('utf-8', errors='ignore').strip()
@@ -341,14 +350,29 @@ class ReceiverNode:
             except KeyboardInterrupt:
                 print("[中断] 用户中断重试，放弃发送完成通知")
                 return False
+            except OSError as e:
+                # Connection refused说明发送端socket已关闭
+                if "Connection refused" in str(e) or (hasattr(e, 'errno') and e.errno == 111):
+                    print(f"[通知失败] Connection refused - 发送端socket已关闭")
+                    print(f"[通知失败] 停止重试（尝试了{attempt}次）")
+                    return False
+                else:
+                    print(f"[警告] 第{attempt}次发送完成通知失败: {e}")
             except Exception as e:
                 print(f"[警告] 第{attempt}次发送完成通知失败: {e}")
+
+            # 检查是否已达最大重试次数
+            if attempt >= max_attempts:
+                print(f"[通知失败] 已达最大重试次数{max_attempts}，放弃发送完成通知")
+                return False
 
             # 指数退避并带随机抖动
             sleep_time = backoff + random.uniform(0, 0.5)
             print(f"[重试] 在 {sleep_time:.1f}s 后进行第{attempt+1}次尝试")
             time.sleep(sleep_time)
             backoff = min(max_backoff, backoff * 2)
+
+        return False  # ✅ 超出最大重试次数
         
     def start_bp_ltp_reception(self, data_size: int, bundle_size: int) -> bool:
         """
@@ -442,9 +466,9 @@ class ReceiverNode:
             bundle_size = data.get("bundle_size", 1000)
             dest_addr = data.get("dest_addr", "192.168.1.1")  # 发送节点的地址
             sequence = data.get("sequence", 1)  # 获取sequence字段，用于EID配置
+            transmission_id = data.get("transmission_id")  # 新增：获取传输ID
 
-            # 清除start_timestamp接收事件，准备新的传输
-            self.start_timestamp_received_event.clear()
+            # 清除接收事件，准备新的传输
             self.reception_event.clear()
 
             # 重置reception_result
@@ -454,8 +478,9 @@ class ReceiverNode:
                 "success": False
             }
 
-            # 重置current_transmission
+            # 重置current_transmission，保存transmission_id
             self.current_transmission = {
+                "transmission_id": transmission_id,  # 新增：保存传输ID
                 "data_size": 0,
                 "start_timestamp": 0.0,
                 "link_state": {},
@@ -548,9 +573,6 @@ class ReceiverNode:
             self.current_transmission["start_timestamp"] = start_timestamp
             self.current_transmission["data_size"] = data_size
 
-            # 设置事件，通知handle_metadata已收到start_timestamp
-            self.start_timestamp_received_event.set()
-
             start_time_str = datetime.fromtimestamp(start_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')
             print(f"[数据接收] 开始时间: {start_time_str}, 数据量: {data_size} bytes")
 
@@ -574,18 +596,22 @@ class ReceiverNode:
             metadata = data.copy()
 
             data_size = metadata.get("data_size")
+            start_timestamp = metadata.get("start_timestamp", 0.0)  # 从metadata中直接获取start_timestamp
             link_state = metadata.get("link_state", {})
             protocol_params = metadata.get("protocol_params", {})
             bundle_size = protocol_params.get("bundle_size", 1024)
 
-            # 记录元数据
+            # 记录元数据（包括start_timestamp）
             self.current_transmission["data_size"] = data_size
+            self.current_transmission["start_timestamp"] = start_timestamp
             self.current_transmission["link_state"] = link_state
             self.current_transmission["protocol_params"] = protocol_params
 
+            print(f"[元数据接收] 已从metadata中获取start_timestamp: {start_timestamp}")
+
             # 如果启用了BP/LTP，等待接收完成
             if self.use_bp_ltp and self.bp_ltp_receiver:
-                # 步骤1：等待BP/LTP接收完成（最多等待3000秒）
+                # 等待BP/LTP接收完成（最多等待6000秒）
                 print(f"[等待接收] 等待BP/LTP接收完成...")
                 if self.reception_event.wait(timeout=6000):
                     if self.reception_result.get("success"):
@@ -597,20 +623,13 @@ class ReceiverNode:
                 else:
                     print(f"[警告] BP/LTP接收超时，使用当前时间")
                     end_timestamp = time.time()
-
-                # 步骤2：等待发送端发送start_timestamp（最多等待60秒）
-                print(f"[等待时间戳] 等待发送端发送开始时间戳...")
-                if self.start_timestamp_received_event.wait(timeout=60):
-                    print(f"[时间戳接收] 已收到开始时间戳")
-                else:
-                    print(f"[警告] 等待开始时间戳超时，将使用旧值或0")
             else:
                 # 模拟模式：直接使用当前时间
                 print(f"[接收模式] 使用模拟模式（TCP接收已完成）")
                 end_timestamp = time.time()
 
-            # 计算业务交付时间（毫秒）
-            start_timestamp = self.current_transmission.get("start_timestamp", 0.0)
+            # 使用从metadata中获取的start_timestamp
+            # start_timestamp已经在上面从metadata中获取了
 
             # 验证时间戳有效性
             if start_timestamp <= 0 or start_timestamp > end_timestamp:
@@ -669,7 +688,7 @@ class ReceiverNode:
 
             # 连接到优化器
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(10.0)
+            sock.settimeout(25.0)
             sock.connect((self.optimizer_host, self.optimizer_port))
 
             # 发送数据
@@ -762,10 +781,6 @@ class ReceiverNode:
 
                 # 处理完成，socket已经发送了ACK，直接返回
                 return
-
-            elif message_type == "start_timestamp":
-                # BP/LTP模式：只接收时间戳，不接收数据负载
-                success = self.handle_data_transmission(message)
 
             elif message_type == "data_transmission":
                 success = self.handle_data_transmission(message)
