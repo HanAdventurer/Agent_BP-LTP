@@ -34,8 +34,8 @@ class SenderNode:
                  optimizer_host: str = "192.168.1.3",  # 电脑C的IP
                  optimizer_port: int = 5002,
                  config_file: str = "network_config.csv",
-                 source_eid: str = "ipn:1.1",
-                 destination_eid: str = "ipn:2.1",
+                 source_eid: int = 2,
+                 destination_eid: int = 3,
                  dest_udp_addr: str = "192.168.1.2:1113",
                  own_host: str = "192.168.1.1",  # 本节点（发送节点A）的IP地址
                  use_bp_ltp: bool = True):
@@ -266,7 +266,7 @@ class SenderNode:
                 "bit_error_rate": current_config["bit_error_rate"],
                 "delay_ms": current_config["delay_ms"],
                 "transmission_rate_mbps": current_config["transmission_rate_mbps"],
-                "sequence": (current_config["sequence"] % 27) + 2  # 添加sequence字段，用于接收端EID配置
+                "sequence": (current_config["sequence"] % 12) + 2  # 添加sequence字段，用于接收端EID配置
             }
 
             print(f"[CSV配置 {current_config['sequence']}] {current_config.get('description', '')}")
@@ -380,16 +380,8 @@ class SenderNode:
         # 如果启用了BP/LTP接口，则配置协议栈
         if self.use_bp_ltp and self.bp_ltp_interface:
             try:
-                # 1. 配置链路参数（如果提供了link_state）
-                if link_state:
-                    self.bp_ltp_interface.configure_link_parameters(
-                        bit_error_rate=link_state.get("bit_error_rate", 1e-5),
-                        delay_ms=link_state.get("delay_ms", 100.0),
-                        transmission_rate_mbps=link_state.get("transmission_rate_mbps", 10.0),
-                        data_size=data_size
-                    )
 
-                # 2. 应用协议栈参数
+                # 1. 应用协议栈参数
                 success = self.bp_ltp_interface.apply_protocol_parameters(
                     bundle_size=params.get("bundle_size", 10000),
                     ltp_block_size=params.get("ltp_block_size", 160000),
@@ -397,8 +389,20 @@ class SenderNode:
                     session_count=params.get("session_count"),
                     data_size=data_size,
                     delay_ms=link_state.get("delay_ms", 100.0) if link_state else 100.0,
-                    transmission_rate_mbps=link_state.get("transmission_rate_mbps", 10.0) if link_state else 10.0
+                    transmission_rate_mbps=link_state.get("transmission_rate_mbps", 10.0) if link_state else 1.0
                 )
+                
+                time.sleep(1)
+                # 2. 配置链路参数（如果提供了link_state）
+                if link_state:
+                    self.bp_ltp_interface.configure_link_parameters(
+                        bit_error_rate=link_state.get("bit_error_rate", 1e-5),
+                        delay_ms= link_state.get("delay_ms", 100.0),
+                        transmission_rate_mbps=link_state.get("transmission_rate_mbps", 10.0),
+                        data_size=data_size
+                    )
+
+                time.sleep(1)
 
                 if success:
                     print(f"[BP/LTP配置] 成功应用协议栈参数到ION")
@@ -780,7 +784,7 @@ def main():
     interval = 20  # 传输周期间隔（秒）
 
     # BP/LTP相关参数
-    source_eid = 'ipn:9.2'
+    source_eid = 9
     destination_eid = 8
     dest_udp_addr = '192.168.137.164:1113'
     use_bp_ltp = True  # 启用BP/LTP协议栈

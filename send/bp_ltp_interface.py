@@ -21,11 +21,11 @@ class BPLTPInterface:
     """BP/LTP协议栈接口类"""
 
     def __init__(self,
-                 source_eid: str = "ipn:1.1",
-                 destination_eid: int = 2,
+                 source_eid: int = 2,
+                 destination_eid: int = 3,
                  dest_addr: str = "192.168.1.2",
                  dest_udp_addr: str = "192.168.1.2:1113",
-                 bp_ttl: int = 3600):
+                 bp_ttl: int = 1000):
         """
         初始化BP/LTP接口
 
@@ -83,8 +83,8 @@ class BPLTPInterface:
         Returns:
             配置信息字典
         """
-        # 计算带宽（bit/s）
-        bandwidth = int(transmission_rate_mbps * 1_000_000)
+        # 计算带宽（Kbit/s）
+        bandwidth = int(transmission_rate_mbps * 1000)
 
         # 计算丢包率（基于segment大小）
         loss_rate = calculate_packet_loss(bit_error_rate, self.current_ltp_segment)
@@ -93,7 +93,7 @@ class BPLTPInterface:
         print(f"\n[链路配置]")
         print(f"  误码率: {bit_error_rate}")
         print(f"  延时: {delay_ms}ms")
-        print(f"  带宽: {bandwidth}bit/s ({transmission_rate_mbps}Mbps)")
+        print(f"  带宽: {transmission_rate_mbps}Mbps")
         print(f"  丢包率: {loss_rate_percent:.4f}%")
 
         # 配置网络参数（使用tc命令）
@@ -192,7 +192,7 @@ class BPLTPInterface:
         """
         try:
             # 获取节点启动时间
-            source_node = int(self.source_eid.split(':')[1].split('.')[0])
+            source_node = self.source_eid
             node_start_time = extract_time_from_ionadmin(source_node, self.destination_eid)
 
             if not node_start_time:
@@ -205,7 +205,7 @@ class BPLTPInterface:
             # 设置contact
             setup_contact(
                 node_start_time=node_start_time,
-                own_eid=int(self.source_eid.split(':')[1].split('.')[0]),
+                own_eid=self.source_eid,
                 destination_eid=self.destination_eid,
                 send_rate_B=send_rate_B
             )
@@ -231,25 +231,26 @@ class BPLTPInterface:
         try:
             # 计算传输周期数（基于bundle大小）
             nbr_of_cycles = math.ceil(data_size / self.current_bundle_size)
-            if nbr_of_cycles > 500:
+            if data_size > 1000000:
                 self.bp_ttl = self.bp_ttl + 3000
             # 计算发送速率（Bytes/s）
             send_rate_B = int(transmission_rate_mbps * 1_000_000 / 8)
 
             # 构造目标EID
             destination_eid = f"ipn:{self.destination_eid}.{self.destination_sequence}"
+            source_eid = f"ipn:{self.source_eid}.{self.destination_sequence}"  # 源EID后缀与目标EID后缀不同，避免冲突
 
             print(f"\n[BP/LTP传输]")
             print(f"  数据大小: {data_size} bytes")
             print(f"  Bundle数量: {nbr_of_cycles}")
             print(f"  发送速率: {send_rate_B} Bytes/s")
-            print(f"  源: {self.source_eid}")
+            print(f"  源: {source_eid}")
             print(f"  目标: {destination_eid}")
-
+            
             # 发送数据
             send_time = send_bpdriver_command(
                 nbr_of_cycles=nbr_of_cycles,
-                source=self.source_eid,
+                source=source_eid,
                 destination=destination_eid,
                 packet_size=self.current_bundle_size,
                 BP_TTL=self.bp_ttl,

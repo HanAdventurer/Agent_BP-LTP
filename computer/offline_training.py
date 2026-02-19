@@ -409,42 +409,47 @@ class OfflineTrainer:
 
 def main():
     """主函数"""
-    import argparse
+    # ==================== 配置参数（在此修改） ====================
+    dataset_path = '/root/agent/training_data.csv'              # 训练数据集CSV文件路径
+    epochs = 10                                                 # 训练轮数
+    batch_size = 50                                             # 批次大小
+    save_path = '/root/agent/computer/dqn_model_pretrained.pth'  # 模型保存路径
+    save_interval = 0                                           # 保存间隔（每N批保存一次，0表示只在结束时保存）
+    load_model = None                                           # 加载已有模型继续训练（None表示从头训练）
+    use_gpu = True                                              # 是否使用GPU（如果可用）
 
-    parser = argparse.ArgumentParser(description='DQN离线训练工具')
-    parser.add_argument('--dataset', type=str, required=True,
-                        help='训练数据集CSV文件路径')
-    parser.add_argument('--epochs', type=int, default=5,
-                        help='训练轮数（默认5）')
-    parser.add_argument('--batch-size', type=int, default=50,
-                        help='批次大小（默认50）')
-    parser.add_argument('--save-path', type=str,
-                        default='/root/agent/computer/dqn_model_pretrained.pth',
-                        help='模型保存路径')
-    parser.add_argument('--save-interval', type=int, default=0,
-                        help='保存间隔（每N批保存一次，0表示只在结束时保存）')
-    parser.add_argument('--load-model', type=str, default=None,
-                        help='加载已有模型继续训练')
-    parser.add_argument('--cpu-only', action='store_true',
-                        help='强制使用CPU模式')
+    # 如果要加载已有模型继续训练，取消下面一行的注释并修改路径：
+    # load_model = '/root/agent/computer/dqn_model_stage1.pth'
+    # ============================================================
 
-    args = parser.parse_args()
+    print("="*60)
+    print("DQN离线训练工具")
+    print("="*60)
+    print(f"数据集路径: {dataset_path}")
+    print(f"训练轮数: {epochs}")
+    print(f"批次大小: {batch_size}")
+    print(f"模型保存路径: {save_path}")
+    print(f"保存间隔: {save_interval if save_interval > 0 else '仅在结束时保存'}")
+    print(f"预加载模型: {load_model if load_model else '不加载（从头训练）'}")
+    print(f"使用GPU: {'是' if use_gpu else '否（仅CPU）'}")
+    print("="*60)
+    print()
 
     # 创建离线训练器
     trainer = OfflineTrainer(
-        model_save_path=args.save_path,
-        use_gpu=not args.cpu_only
+        model_save_path=save_path,
+        use_gpu=use_gpu
     )
 
     # 如果指定了加载模型，先加载
-    if args.load_model:
-        print(f"\n[预加载] 加载已有模型: {args.load_model}")
-        trainer.load_model(args.load_model)
+    if load_model:
+        print(f"[预加载] 加载已有模型: {load_model}")
+        trainer.load_model(load_model)
         print()
 
     # 加载数据集
-    print(f"[数据集] 加载训练数据: {args.dataset}")
-    records = trainer.load_dataset_from_csv(args.dataset)
+    print(f"[数据集] 加载训练数据: {dataset_path}")
+    records = trainer.load_dataset_from_csv(dataset_path)
 
     if not records:
         print("[错误] 无法加载数据集，退出")
@@ -458,19 +463,19 @@ def main():
     # 开始训练
     success = trainer.train_from_dataset(
         records=records,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        save_interval=args.save_interval
+        epochs=epochs,
+        batch_size=batch_size,
+        save_interval=save_interval
     )
 
     if success:
         # 保存最终模型
         trainer.save_model()
-        print(f"\n✅ 训练完成！模型已保存到: {args.save_path}")
+        print(f"\n✅ 训练完成！模型已保存到: {save_path}")
         print(f"\n使用方法：")
-        print(f"  1. 将训练好的模型复制到优化器目录")
-        print(f"  2. 在优化器启动时加载模型（需要添加加载逻辑）")
-        print(f"  3. 或者直接使用离线训练器启动优化服务")
+        print(f"  1. 在mode_dqn_v2_gpu.py的main()函数中设置pretrained_model路径")
+        print(f"  2. 启动优化器即可自动加载预训练模型")
+        print(f"     示例: pretrained_model = '{save_path}'")
     else:
         print(f"\n❌ 训练失败")
         sys.exit(1)

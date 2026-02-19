@@ -48,16 +48,16 @@ def execute_command(command):
 
 
 def configure_network(dest_addr, bandwidth, tx_delay, loss_rate):
-    bandwidth = "50m"
+    # bandwidth = "50"
     """配置网络参数"""
     execute_command("sudo tc qdisc del dev eth0 root")
     execute_command("sudo tc qdisc add dev eth0 root handle 1: htb")
-    execute_command(f"sudo tc class add dev eth0 parent 1: classid 1:10 htb rate {bandwidth}bit")
-    print(f"sudo tc class add dev eth0 parent 1: classid 1:10 htb rate {bandwidth}bit")
+    execute_command(f"sudo tc class add dev eth0 parent 1: classid 1:10 htb rate {bandwidth}kbit")
+    print(f"sudo tc class add dev eth0 parent 1: classid 1:10 htb rate {bandwidth}kbit")
     execute_command(f"sudo tc filter add dev eth0 protocol ip parent 1: prio 1 u32 match ip dst {dest_addr} flowid 1:10")
     print(f"sudo tc filter add dev eth0 protocol ip parent 1: prio 1 u32 match ip dst {dest_addr} flowid 1:10")
-    execute_command(f"sudo tc qdisc add dev eth0 parent 1:10 netem loss {loss_rate}% delay {tx_delay}ms limit 10000")
-    print(f"sudo tc qdisc add dev eth0 parent 1:10 netem loss {loss_rate}% delay {tx_delay}ms limit 10000")
+    execute_command(f"sudo tc qdisc add dev eth0 parent 1:10 netem loss {loss_rate}% delay {tx_delay}ms limit 20000")
+    print(f"sudo tc qdisc add dev eth0 parent 1:10 netem loss {loss_rate}% delay {tx_delay}ms limit 20000")
 
 def extract_time_from_ionadmin(source_node, destination_node):
     """从输出中提取特定时间并返回字符串形式"""
@@ -94,7 +94,7 @@ def execute_interactive_commands(cmd1, cmd2):
         process.stdin.write(cmd2 + "\n")
         process.stdin.flush()
         output, error = process.communicate(timeout=10)
-        print(f"Output:\n{output}")
+        # print(f"Output:\n{output}")
         if error:
             print(f"Error:\n{error}")
         return output

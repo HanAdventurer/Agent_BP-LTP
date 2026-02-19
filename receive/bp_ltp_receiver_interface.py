@@ -104,7 +104,7 @@ class BPLTPReceiverInterface:
             )
 
             print(f"[接收完成] bpcounter已停止，停止时间戳: {stop_time}")
-            print(f"[接收报告]:\n{report}")
+            # print(f"[接收报告]:\n{report}")
 
             return report, stop_time
 
@@ -132,12 +132,12 @@ class BPLTPReceiverInterface:
 
             # 这里可以添加更复杂的报告解析逻辑
             # 根据实际的bpcounter输出格式进行调整
-            lines = report.split('\n')
-            for line in lines:
-                line = line.strip()
-                # 查找关键字段
-                if 'delivered' in line.lower() or 'received' in line.lower():
-                    print(f"[报告] {line}")
+            # lines = report.split('\n')
+            # for line in lines:
+            #     line = line.strip()
+            #     # 查找关键字段
+            #     if 'delivered' in line.lower() or 'received' in line.lower():
+            #         print(f"[报告] {line}")
 
             print(f"[性能指标解析] 完成")
             return metrics
