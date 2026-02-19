@@ -266,7 +266,7 @@ class SenderNode:
                 "bit_error_rate": current_config["bit_error_rate"],
                 "delay_ms": current_config["delay_ms"],
                 "transmission_rate_mbps": current_config["transmission_rate_mbps"],
-                "sequence": (current_config["sequence"] % 12) + 2  # 添加sequence字段，用于接收端EID配置
+                "sequence": (current_config["sequence"] % 35) + 2  # 添加sequence字段，用于接收端EID配置
             }
 
             print(f"[CSV配置 {current_config['sequence']}] {current_config.get('description', '')}")

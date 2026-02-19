@@ -5,6 +5,8 @@ BP/LTP协议栈接口封装
 """
 
 import math
+from time import time
+import time
 from typing import Dict
 from dtn_ion import (
     configure_network,
@@ -25,7 +27,7 @@ class BPLTPInterface:
                  destination_eid: int = 3,
                  dest_addr: str = "192.168.1.2",
                  dest_udp_addr: str = "192.168.1.2:1113",
-                 bp_ttl: int = 1000):
+                 bp_ttl: int = 600):
         """
         初始化BP/LTP接口
 
@@ -83,9 +85,9 @@ class BPLTPInterface:
         Returns:
             配置信息字典
         """
-        # 计算带宽（Kbit/s）
+        # 计算带宽（bit/s）
         bandwidth = int(transmission_rate_mbps * 1000)
-
+        bandwidth = bandwidth*4
         # 计算丢包率（基于segment大小）
         loss_rate = calculate_packet_loss(bit_error_rate, self.current_ltp_segment)
         loss_rate_percent = loss_rate * 100
@@ -232,7 +234,13 @@ class BPLTPInterface:
             # 计算传输周期数（基于bundle大小）
             nbr_of_cycles = math.ceil(data_size / self.current_bundle_size)
             if data_size > 1000000:
-                self.bp_ttl = self.bp_ttl + 3000
+                self.bp_ttl = self.bp_ttl + 400
+
+            if data_size > 3000000:
+                self.bp_ttl = self.bp_ttl + 600
+
+            if data_size > 4000000:
+                self.bp_ttl = self.bp_ttl + 600                
             # 计算发送速率（Bytes/s）
             send_rate_B = int(transmission_rate_mbps * 1_000_000 / 8)
 
@@ -246,6 +254,8 @@ class BPLTPInterface:
             print(f"  发送速率: {send_rate_B} Bytes/s")
             print(f"  源: {source_eid}")
             print(f"  目标: {destination_eid}")
+
+            time.sleep(5)  # 等待1秒，确保前面的配置生效
             
             # 发送数据
             send_time = send_bpdriver_command(

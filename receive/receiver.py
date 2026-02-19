@@ -314,15 +314,17 @@ class ReceiverNode:
         message_len = struct.pack('!I', len(notification_json))
 
         attempt = 0
-        backoff = 1.0
-        max_backoff = 30.0
-        max_attempts = 5  # ✅ 最大重试5次（因为网络可能有高延迟）
+        backoff = 2.0  # 初始退避时间增加到2秒
+        max_backoff = 60.0  # 最大退避时间增加到60秒
+        max_attempts = 15  # ✅ 增加到15次重试（应对时序竞态）
 
-        while attempt < max_attempts:  # ✅ 改为有限循环
+        while attempt < max_attempts:
             attempt += 1
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(25.0)  # ✅ 增加timeout到15秒（适应高延迟网络）
+                sock.settimeout(30.0)  # 增加timeout到30秒
+
+                print(f"[通知] 第{attempt}次尝试连接发送端 {self.sender_host}:{self.sender_notification_port}")
                 sock.connect((self.sender_host, self.sender_notification_port))
 
                 sock.sendall(message_len)
@@ -333,7 +335,7 @@ class ReceiverNode:
 
                 if not ack:
                     print(f"[警告] 第{attempt}次发送未收到确认，准备重试")
-                    continue  # ✅ 继续重试，不抛异常
+                    continue
 
                 try:
                     ack_text = ack.decode('utf-8', errors='ignore').strip()
@@ -342,7 +344,7 @@ class ReceiverNode:
 
                 # 如果收到常见确认字样则视为成功
                 if ack_text.upper() in ("OK", "ACK", "RECEIVED") or len(ack_text) > 0:
-                    print(f"[完成通知] 已通知发送端接收完成，确认: {ack_text}")
+                    print(f"[完成通知] ✅ 已成功通知发送端接收完成（第{attempt}次尝试），确认: {ack_text}")
                     return True
                 else:
                     print(f"[警告] 第{attempt}次发送收到非确认信息: '{ack_text}'，准备重试")
@@ -351,11 +353,13 @@ class ReceiverNode:
                 print("[中断] 用户中断重试，放弃发送完成通知")
                 return False
             except OSError as e:
-                # Connection refused说明发送端socket已关闭
+                # ✅ 不再特殊处理Connection refused
+                # Connection refused可能是因为发送端监听socket还没准备好（时序问题）
+                # 应该继续重试而不是立即放弃
                 if "Connection refused" in str(e) or (hasattr(e, 'errno') and e.errno == 111):
-                    print(f"[通知失败] Connection refused - 发送端socket已关闭")
-                    print(f"[通知失败] 停止重试（尝试了{attempt}次）")
-                    return False
+                    print(f"[警告] 第{attempt}次连接被拒绝（Connection refused）")
+                    print(f"  → 可能原因：发送端监听socket还没准备好")
+                    print(f"  → 将在退避后重试")
                 else:
                     print(f"[警告] 第{attempt}次发送完成通知失败: {e}")
             except Exception as e:
