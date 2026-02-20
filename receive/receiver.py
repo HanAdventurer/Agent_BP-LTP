@@ -90,7 +90,8 @@ class RecordLogger:
                         'ltp_segment_size',
                         'session_count',
                         'delivery_time_ms',
-                        'throughput_mbps'
+                        'throughput_mbps',
+                        'total_bytes_received'
                     ])
                 print(f"[记录器] CSV文件已创建: {self.csv_file}")
             else:
@@ -120,6 +121,7 @@ class RecordLogger:
 
             data_size = input_data.get("data_size", 0)
             delivery_time_ms = performance_data.get("delivery_time_ms", 0)
+            total_bytes_received = performance_data.get("total_bytes_received", 0)
 
             # 计算吞吐量（Mbps）
             if delivery_time_ms > 0:
@@ -142,7 +144,8 @@ class RecordLogger:
                     output_data.get("ltp_segment_size", 0),
                     output_data.get("session_count", 0),
                     round(delivery_time_ms, 3),
-                    throughput_mbps
+                    throughput_mbps,
+                    total_bytes_received
                 ])
 
         except Exception as e:
@@ -183,7 +186,8 @@ class RecordLogger:
                            ltp_block_size: int,
                            ltp_segment_size: int,
                            session_count: int,
-                           delivery_time_ms: float):
+                           delivery_time_ms: float,
+                           total_bytes_received: int = 0):
         """
         记录一次传输的完整信息
 
@@ -197,6 +201,7 @@ class RecordLogger:
             ltp_segment_size: LTP Segment大小
             session_count: 会话数量
             delivery_time_ms: 业务交付时间（毫秒）
+            total_bytes_received: bpcounter报告的实际接收字节数
         """
         record = {
             "input": {
@@ -212,7 +217,8 @@ class RecordLogger:
                 "session_count": session_count
             },
             "performance": {
-                "delivery_time_ms": delivery_time_ms
+                "delivery_time_ms": delivery_time_ms,
+                "total_bytes_received": total_bytes_received
             },
             "timestamp": time.time()
         }
@@ -529,6 +535,18 @@ class ReceiverNode:
                     )
                     print(f"[链路配置] 网络链路已配置完成")
 
+                    # 在正式接收前，清理可能遗留的数据包
+                    # 防止上一轮传输的遗留数据干扰本轮接收
+                    residual_count = self.bp_ltp_receiver.run_bpcounter_with_timeout(timeout=15)
+                    if residual_count > 0:
+                        print(f"[警告] 清理了 {residual_count} 个上轮遗留的数据包")
+
+                    # 关键修复：在cleanup结束后增加缓冲时间
+                    # 目的：确保网络中延迟的TTL=0结束信号完全过期
+                    # 避免正式接收时立即收到遗留的TTL=0导致bpcounter提前退出
+                    print(f"[缓冲] 等待5秒，确保遗留的控制信号完全清理...")
+                    time.sleep(5)
+
                     # 启动BP/LTP接收监听
                     reception_started = self.start_bp_ltp_reception(data_size, bundle_size)
                     if reception_started:
@@ -614,6 +632,7 @@ class ReceiverNode:
             print(f"[元数据接收] 已从metadata中获取start_timestamp: {start_timestamp}")
 
             # 如果启用了BP/LTP，等待接收完成
+            total_bytes_received = 0  # 初始化
             if self.use_bp_ltp and self.bp_ltp_receiver:
                 # 等待BP/LTP接收完成（最多等待6000秒）
                 print(f"[等待接收] 等待BP/LTP接收完成...")
@@ -621,6 +640,11 @@ class ReceiverNode:
                     if self.reception_result.get("success"):
                         end_timestamp = self.reception_result.get("stop_time", time.time())
                         print(f"[接收完成] BP/LTP接收已完成，结束时间: {datetime.fromtimestamp(end_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')}")
+
+                        # 从metrics中提取total_bytes_received
+                        metrics = self.reception_result.get("metrics", {})
+                        total_bytes_received = metrics.get("total_bytes_received", 0)
+                        print(f"[接收统计] 实际接收字节数: {total_bytes_received}")
                     else:
                         print(f"[警告] BP/LTP接收失败，使用当前时间")
                         end_timestamp = time.time()
@@ -658,7 +682,8 @@ class ReceiverNode:
                 ltp_block_size=protocol_params.get("ltp_block_size", 0),
                 ltp_segment_size=protocol_params.get("ltp_segment_size", 0),
                 session_count=protocol_params.get("session_count", 0),
-                delivery_time_ms=delivery_time_ms
+                delivery_time_ms=delivery_time_ms,
+                total_bytes_received=total_bytes_received
             )
 
             return True
@@ -671,6 +696,13 @@ class ReceiverNode:
         """
         将记录发送到优化器(电脑C)
 
+        过滤规则：
+        1. 过滤掉delivery_time_ms为0的记录（无效数据）
+        2. 过滤掉计划接收字节数与实际接收字节数不一致的记录（数据不完整）
+        3. 移除total_bytes_received字段（该字段仅用于CSV人工观察）
+
+        注意：所有数据（包括被过滤的）都会记录到CSV文件中
+
         Args:
             records: 要发送的记录列表
 
@@ -682,11 +714,66 @@ class ReceiverNode:
                 print("[警告] 没有要发送的记录")
                 return True
 
+            # 过滤和清理记录
+            filtered_records = []
+            filter_stats = {
+                "delivery_time_zero": 0,
+                "bytes_mismatch": 0,
+                "valid": 0
+            }
+
+            for record in records:
+                input_data = record.get("input", {})
+                performance = record.get("performance", {})
+
+                data_size = input_data.get("data_size", 0)
+                delivery_time_ms = performance.get("delivery_time_ms", 0)
+                total_bytes_received = performance.get("total_bytes_received", 0)
+
+                # 检查1: delivery_time_ms是否有效
+                if delivery_time_ms <= 0:
+                    filter_stats["delivery_time_zero"] += 1
+                    print(f"[过滤] 跳过无效记录（delivery_time_ms={delivery_time_ms}）")
+                    continue
+
+                # 检查2: 计划接收字节数与实际接收字节数是否一致
+                if total_bytes_received > 0 and data_size != total_bytes_received:
+                    filter_stats["bytes_mismatch"] += 1
+                    print(f"[过滤] 跳过数据不完整记录（计划接收:{data_size}字节, 实际接收:{total_bytes_received}字节）")
+                    continue
+
+                # 通过所有检查，准备发送
+                filter_stats["valid"] += 1
+
+                # 复制记录，移除total_bytes_received字段
+                clean_record = {
+                    "input": input_data,
+                    "output": record.get("output", {}),
+                    "performance": {
+                        "delivery_time_ms": delivery_time_ms
+                        # 不包含total_bytes_received
+                    },
+                    "timestamp": record.get("timestamp", time.time())
+                }
+
+                filtered_records.append(clean_record)
+
+            if not filtered_records:
+                print("[警告] 过滤后没有有效记录可发送")
+                print(f"[过滤统计] delivery_time=0: {filter_stats['delivery_time_zero']}条, "
+                      f"字节数不匹配: {filter_stats['bytes_mismatch']}条")
+                return True
+
+            print(f"[记录过滤] 原始记录: {len(records)}条, 有效记录: {filter_stats['valid']}条")
+            if filter_stats['delivery_time_zero'] > 0 or filter_stats['bytes_mismatch'] > 0:
+                print(f"[过滤详情] delivery_time=0: {filter_stats['delivery_time_zero']}条, "
+                      f"字节数不匹配: {filter_stats['bytes_mismatch']}条")
+
             # 构造发送数据
             send_data = {
                 "type": "training_records",
-                "records": records,
-                "count": len(records),
+                "records": filtered_records,
+                "count": len(filtered_records),
                 "timestamp": time.time()
             }
 
@@ -707,7 +794,7 @@ class ReceiverNode:
             ack = sock.recv(1024)
             sock.close()
 
-            print(f"[记录发送] 成功发送 {len(records)} 条记录到优化器")
+            print(f"[记录发送] 成功发送 {len(filtered_records)} 条有效记录到优化器")
             print(f"[确认信息] {ack.decode('utf-8')}")
 
             return True

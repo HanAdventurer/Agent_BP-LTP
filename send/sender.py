@@ -523,9 +523,6 @@ class SenderNode:
                 else:
                     print(f"[链路配置] 接收节点已确认配置完成，准备开始传输")
 
-            # 记录开始时间戳（用于TCP模拟模式）
-            start_timestamp = time.time()
-
             # 如果启用了BP/LTP接口，使用BP/LTP进行传输
             if self.use_bp_ltp and self.bp_ltp_interface:
                 try:
@@ -542,7 +539,9 @@ class SenderNode:
 
                     # 步骤2：设置transmission contact
                     self.bp_ltp_interface.setup_transmission_contact(transmission_rate)
-                    time.sleep(3)
+                    time.sleep(25)
+                    # 记录开始时间戳（用于TCP模拟模式）
+                    start_timestamp = time.time()
                     # 步骤3：通过BP/LTP发送数据，获取真正的发送时间戳
                     bp_send_time = self.bp_ltp_interface.transmit_data_via_bp_ltp(
                         data_size=data_size,

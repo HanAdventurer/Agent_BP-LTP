@@ -7,7 +7,8 @@ BP/LTP接收器接口封装
 import math
 from typing import Tuple
 from dtn_ion import run_bpcounter_and_monitor, configure_network
-
+import subprocess
+import time
 
 class BPLTPReceiverInterface:
     """BP/LTP接收器接口类"""
@@ -81,7 +82,75 @@ class BPLTPReceiverInterface:
               f"Bundle大小: {bundle_size} bytes, "
               f"Bundle数量: {bundle_count}")
         return bundle_count
+    def run_bpcounter_with_timeout(self, timeout: int = 5) -> int:
+        """
+        在正式接收数据前，运行bpcounter清理遗留数据
 
+        作用：清理上一轮传输可能遗留在网络中的数据包，防止干扰本轮接收
+
+        Args:
+            timeout: 清理持续时间（秒），默认5秒
+
+        Returns:
+            清理的遗留数据包数量（bundle count）
+        """
+        command = f"sudo bpcounter {self.own_eid}"
+        print(f"\n[遗留数据清理] 启动bpcounter清理遗留数据（持续{timeout}秒）")
+        print(f"  命令: {command}")
+
+        try:
+            process = subprocess.Popen(
+                command, shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+
+            start_time = time.time()
+            output_lines = []
+            residual_count = 0
+
+            while True:
+                line = process.stdout.readline()
+                if not line and process.poll() is not None:
+                    break
+
+                line = line.strip()
+                if line:
+                    output_lines.append(line)
+                    # 统计接收到的bundle（遗留数据）
+                    if "bundles" in line.lower() and "received" in line.lower():
+                        print(f"  [遗留数据] {line}")
+
+                # 超时后终止
+                if time.time() - start_time > timeout:
+                    print(f"[遗留数据清理] {timeout}秒超时，终止清理进程")
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    break
+
+            # 解析输出，提取遗留数据统计
+            full_output = "\n".join(output_lines)
+            import re
+            # 尝试从报告中提取bundle数量
+            match = re.search(r'(\d+)\s+bundles?\s+received', full_output, re.IGNORECASE)
+            if match:
+                residual_count = int(match.group(1))
+
+            if residual_count > 0:
+                print(f"[遗留数据清理] ✅ 清理完成，共清理 {residual_count} 个遗留bundle")
+            else:
+                print(f"[遗留数据清理] ✅ 清理完成，无遗留数据")
+
+            return residual_count
+
+        except Exception as e:
+            print(f"[错误] 遗留数据清理失败: {e}")
+            return 0
     def monitor_reception(self, max_count: int) -> Tuple[str, float]:
         """
         监听BP/LTP数据接收过程
@@ -123,6 +192,8 @@ class BPLTPReceiverInterface:
             包含性能指标的字典
         """
         try:
+            import re
+
             metrics = {
                 "total_bundles_received": 0,
                 "total_bytes_received": 0,
@@ -130,18 +201,37 @@ class BPLTPReceiverInterface:
                 "report_raw": report
             }
 
-            # 这里可以添加更复杂的报告解析逻辑
-            # 根据实际的bpcounter输出格式进行调整
-            # lines = report.split('\n')
-            # for line in lines:
-            #     line = line.strip()
-            #     # 查找关键字段
-            #     if 'delivered' in line.lower() or 'received' in line.lower():
-            #         print(f"[报告] {line}")
+            # 解析bpcounter报告
+            # 查找"Total bytes:"字段
+            lines = report.split('\n')
+            for line in lines:
+                line = line.strip()
 
-            print(f"[性能指标解析] 完成")
+                # 匹配 "Total bytes: XXXXX" 格式
+                match = re.search(r'Total\s+bytes:\s*(\d+)', line, re.IGNORECASE)
+                if match:
+                    total_bytes = int(match.group(1))
+                    metrics["total_bytes_received"] = total_bytes
+                    print(f"[报告解析] Total bytes: {total_bytes}")
+
+                # 可以继续解析其他字段（如果需要）
+                # 例如：Total bundles, Delivery rate等
+                if 'bundles' in line.lower() and 'total' in line.lower():
+                    bundle_match = re.search(r'(\d+)', line)
+                    if bundle_match:
+                        metrics["total_bundles_received"] = int(bundle_match.group(1))
+                        print(f"[报告解析] Total bundles: {metrics['total_bundles_received']}")
+
+            print(f"[性能指标解析] 完成 - 接收字节数: {metrics['total_bytes_received']}")
             return metrics
 
         except Exception as e:
             print(f"[错误] 解析bpcounter报告失败: {e}")
-            return {}
+            import traceback
+            traceback.print_exc()
+            return {
+                "total_bundles_received": 0,
+                "total_bytes_received": 0,
+                "delivery_rate": 0.0,
+                "report_raw": report
+            }

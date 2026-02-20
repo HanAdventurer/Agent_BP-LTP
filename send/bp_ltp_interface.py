@@ -27,7 +27,7 @@ class BPLTPInterface:
                  destination_eid: int = 3,
                  dest_addr: str = "192.168.1.2",
                  dest_udp_addr: str = "192.168.1.2:1113",
-                 bp_ttl: int = 600):
+                 bp_ttl: int = 300):
         """
         初始化BP/LTP接口
 
@@ -234,13 +234,13 @@ class BPLTPInterface:
             # 计算传输周期数（基于bundle大小）
             nbr_of_cycles = math.ceil(data_size / self.current_bundle_size)
             if data_size > 1000000:
-                self.bp_ttl = self.bp_ttl + 400
+                self.bp_ttl = self.bp_ttl + 300
 
             if data_size > 3000000:
-                self.bp_ttl = self.bp_ttl + 600
+                self.bp_ttl = self.bp_ttl + 300
 
             if data_size > 4000000:
-                self.bp_ttl = self.bp_ttl + 600                
+                self.bp_ttl = self.bp_ttl + 300                
             # 计算发送速率（Bytes/s）
             send_rate_B = int(transmission_rate_mbps * 1_000_000 / 8)
 
